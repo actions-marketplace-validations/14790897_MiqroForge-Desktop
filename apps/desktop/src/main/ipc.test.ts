@@ -1,322 +1,519 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { spawnSync } from 'child_process';
+import { readFileSync, writeFileSync } from 'fs';
+import {
+  classifyKernelInstall,
+  classifyWslFeatureState,
+  decodeWslOutput,
+  ELEVATION_CANCELLED,
+  hasNonRootUser,
+  isBashCapableDistro,
+  readFeatureStates,
+  runElevated,
+  summarizeElevated,
+  wslKernelPresent,
+  wslPackageInstalled,
+  wslStatusWorks,
+} from './ipc/wsl-state';
 
-// ── Import the function we want to test ──────────────────────────
-// runWslCheckInternal is not exported (it's a local function inside registerIpcHandlers).
-// We test it by extracting and mocking the core logic.
-//
-// The function's core behavior:
-//  1. Platform check → not-supported on non-win32
-//  2. DISM check → featureState based on WSL + VMP feature states
-//  3. Reboot detection → PendingFileRenameOperations + CBS RebootPending
-//  4. wsl --status → installed, version
-//  5. wsl --list --quiet → distros
-//  6. id -u → initialized detection
-//
-// We test the discrete pieces that drive the state machine.
-
+// The helpers under test spawn system commands; mock child_process.
 vi.mock('child_process', () => ({
   spawnSync: vi.fn(),
 }));
 
-// Reconstruct the state-machine logic from runWslCheckInternal
-// so we can test it without Electron IPC wiring.
-function deriveFeatureState(opts: {
-  platform: string;
-  featureWsl: boolean;
-  featureVmp: boolean;
-  wslStatusCode: number | null;
-  wslStatusOutput: string;
-  wslListCode: number | null;
-  wslListOutput: string;
-  idUCode: number | null;
-  idUOutput: string;
-  pendingFileRename: boolean;
-  cbsRebootPending: boolean;
-}) {
-  const isWindows = opts.platform === 'win32';
-  if (!isWindows) {
-    return {
-      featureState: 'not-supported' as const,
-      rebootRequired: false,
-      installed: false,
-      distros: [] as string[],
-    };
-  }
+// ...and touch the filesystem only through the trampoline temp dir.
+vi.mock('fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs')>();
+  return {
+    ...actual,
+    mkdtempSync: vi.fn(() => 'C:\\Temp\\miqi-elev-test'),
+    writeFileSync: vi.fn(),
+    readFileSync: vi.fn(),
+    rmSync: vi.fn(),
+  };
+});
 
-  const rebootRequired = opts.pendingFileRename || opts.cbsRebootPending;
+const mockedSpawnSync = vi.mocked(spawnSync);
+const mockedReadFileSync = vi.mocked(readFileSync);
+const mockedWriteFileSync = vi.mocked(writeFileSync);
 
-  let featureWsl = opts.featureWsl;
-  let featureVmp = opts.featureVmp;
-
-  let featureState: string = 'not-supported';
-  if (!featureWsl && !featureVmp) featureState = 'not-enabled';
-
-  let installed = false;
-  let distros: string[] = [];
-  const isWslPresent = opts.wslStatusCode === 0 || opts.wslListCode === 0;
-
-  if (opts.wslStatusCode === 0 && opts.wslStatusOutput.length > 0) {
-    installed = true;
-  }
-
-  if (installed) {
-    if (opts.wslListCode === 0) {
-      distros = opts.wslListOutput
-        .split(/\r?\n/)
-        .map((l) => l.trim())
-        .filter(Boolean);
-    }
-
-    let initialized = false;
-    if (distros.length > 0) {
-      if (opts.idUCode === 0 && opts.idUOutput?.trim()) {
-        const uid = parseInt(opts.idUOutput.trim(), 10);
-        if (!Number.isNaN(uid) && uid >= 0) initialized = true;
-      }
-    }
-
-    featureState = distros.length === 0 || !initialized ? 'installed-but-not-initialized' : 'ready';
-  } else if (featureState !== 'not-enabled') {
-    featureState = featureWsl || featureVmp ? 'not-installed' : 'not-enabled';
-  }
-
-  return { featureState, rebootRequired, installed, distros };
+function spawnResult(result: Partial<ReturnType<typeof spawnSync>>) {
+  return {
+    status: 0,
+    stdout: '',
+    stderr: '',
+    signal: null,
+    error: undefined,
+    pid: 1,
+    output: [],
+    ...result,
+  } as unknown as ReturnType<typeof spawnSync>;
 }
 
-// ── Tests ────────────────────────────────────────────────────────
+function mockSpawn(result: Partial<ReturnType<typeof spawnSync>>) {
+  mockedSpawnSync.mockReturnValue(spawnResult(result));
+}
 
-describe('WSL feature state machine (runWslCheckInternal logic)', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
+beforeEach(() => {
+  vi.clearAllMocks();
+});
 
-  describe('platform detection', () => {
-    it('returns not-supported on non-Windows', () => {
-      const result = deriveFeatureState({
-        platform: 'darwin',
+// ── Feature state classification (runWslCheckInternal core) ─────────
+
+describe('classifyWslFeatureState', () => {
+  it('returns not-supported on non-Windows', () => {
+    expect(
+      classifyWslFeatureState({
+        isWindows: false,
         featureWsl: false,
         featureVmp: false,
-        wslStatusCode: null,
-        wslStatusOutput: '',
-        wslListCode: null,
-        wslListOutput: '',
-        idUCode: null,
-        idUOutput: '',
-        pendingFileRename: false,
-        cbsRebootPending: false,
-      });
-      expect(result.featureState).toBe('not-supported');
-      expect(result.installed).toBe(false);
-      expect(result.rebootRequired).toBe(false);
-    });
+        featureReadOk: true,
+        wslInstalled: false,
+        usableDistros: [],
+        initialized: false,
+      })
+    ).toBe('not-supported');
+  });
 
-    it('returns not-supported on Linux', () => {
-      const result = deriveFeatureState({
-        platform: 'linux',
+  it('returns not-enabled when both features are off and WSL is absent', () => {
+    expect(
+      classifyWslFeatureState({
+        isWindows: true,
         featureWsl: false,
         featureVmp: false,
-        wslStatusCode: null,
-        wslStatusOutput: '',
-        wslListCode: null,
-        wslListOutput: '',
-        idUCode: null,
-        idUOutput: '',
-        pendingFileRename: false,
-        cbsRebootPending: false,
-      });
-      expect(result.featureState).toBe('not-supported');
-    });
+        featureReadOk: true,
+        wslInstalled: false,
+        usableDistros: [],
+        initialized: false,
+      })
+    ).toBe('not-enabled');
   });
 
-  describe('feature state: not-enabled', () => {
-    it('returns not-enabled when both WSL and VMP features are off', () => {
-      const result = deriveFeatureState({
-        platform: 'win32',
+  it('returns not-installed when features are on but WSL is absent', () => {
+    expect(
+      classifyWslFeatureState({
+        isWindows: true,
+        featureWsl: true,
+        featureVmp: true,
+        featureReadOk: true,
+        wslInstalled: false,
+        usableDistros: [],
+        initialized: false,
+      })
+    ).toBe('not-installed');
+  });
+
+  it('returns not-installed when only one feature is on and WSL is absent', () => {
+    expect(
+      classifyWslFeatureState({
+        isWindows: true,
+        featureWsl: true,
+        featureVmp: false,
+        featureReadOk: true,
+        wslInstalled: false,
+        usableDistros: [],
+        initialized: false,
+      })
+    ).toBe('not-installed');
+  });
+
+  it('returns not-installed (not not-enabled) when the feature read failed', () => {
+    // Unreadable feature state must not be classified as not-enabled:
+    // enabling features would loop forever on a machine where the
+    // features are actually on but the kernel is missing.
+    expect(
+      classifyWslFeatureState({
+        isWindows: true,
         featureWsl: false,
         featureVmp: false,
-        wslStatusCode: null,
-        wslStatusOutput: '',
-        wslListCode: null,
-        wslListOutput: '',
-        idUCode: null,
-        idUOutput: '',
-        pendingFileRename: false,
-        cbsRebootPending: false,
-      });
-      expect(result.featureState).toBe('not-enabled');
+        featureReadOk: false,
+        wslInstalled: false,
+        usableDistros: [],
+        initialized: false,
+      })
+    ).toBe('not-installed');
+  });
+
+  it('returns installed-but-not-initialized when no usable distro exists', () => {
+    expect(
+      classifyWslFeatureState({
+        isWindows: true,
+        featureWsl: true,
+        featureVmp: true,
+        featureReadOk: true,
+        wslInstalled: true,
+        usableDistros: [],
+        initialized: false,
+      })
+    ).toBe('installed-but-not-initialized');
+  });
+
+  it('returns installed-but-not-initialized when distro has no non-root user', () => {
+    expect(
+      classifyWslFeatureState({
+        isWindows: true,
+        featureWsl: true,
+        featureVmp: true,
+        featureReadOk: true,
+        wslInstalled: true,
+        usableDistros: ['Ubuntu'],
+        initialized: false,
+      })
+    ).toBe('installed-but-not-initialized');
+  });
+
+  it('returns ready when a usable distro is initialized', () => {
+    expect(
+      classifyWslFeatureState({
+        isWindows: true,
+        featureWsl: true,
+        featureVmp: true,
+        featureReadOk: true,
+        wslInstalled: true,
+        usableDistros: ['Ubuntu'],
+        initialized: true,
+      })
+    ).toBe('ready');
+  });
+});
+
+// ── Feature state read (WMI, unelevated) ────────────────────────────
+
+describe('readFeatureStates', () => {
+  it('parses WMI InstallState output', () => {
+    mockSpawn({
+      status: 0,
+      stdout: 'Microsoft-Windows-Subsystem-Linux=1\r\nVirtualMachinePlatform=2\r\n',
+    });
+    expect(readFeatureStates()).toEqual({
+      ok: true,
+      featureWsl: true,
+      featureVmp: false,
     });
   });
 
-  describe('feature state: not-installed', () => {
-    it('returns not-installed when features are enabled but wsl not found', () => {
-      const result = deriveFeatureState({
-        platform: 'win32',
-        featureWsl: true,
-        featureVmp: true,
-        wslStatusCode: null,
-        wslStatusOutput: '',
-        wslListCode: null,
-        wslListOutput: '',
-        idUCode: null,
-        idUOutput: '',
-        pendingFileRename: false,
-        cbsRebootPending: false,
-      });
-      expect(result.featureState).toBe('not-installed');
+  it('treats both features as disabled when WMI lists neither', () => {
+    mockSpawn({ status: 0, stdout: 'SomeUnrelatedFeature=1\r\n' });
+    expect(readFeatureStates()).toEqual({
+      ok: true,
+      featureWsl: false,
+      featureVmp: false,
     });
   });
 
-  describe('feature state: installed-but-not-initialized', () => {
-    it('returns installed-but-not-initialized when distros exist but not initialized', () => {
-      const result = deriveFeatureState({
-        platform: 'win32',
-        featureWsl: true,
-        featureVmp: true,
-        wslStatusCode: 0,
-        wslStatusOutput: 'Default Version: 2',
-        wslListCode: 0,
-        wslListOutput: 'Ubuntu',
-        idUCode: 1, // command failed (no user yet)
-        idUOutput: '',
-        pendingFileRename: false,
-        cbsRebootPending: false,
-      });
-      expect(result.featureState).toBe('installed-but-not-initialized');
-      expect(result.installed).toBe(true);
-      expect(result.distros).toEqual(['Ubuntu']);
-    });
+  it('returns ok:false on empty output (cannot verify)', () => {
+    mockSpawn({ status: 0, stdout: '' });
+    expect(readFeatureStates().ok).toBe(false);
+  });
 
-    it('returns installed-but-not-initialized when distros exist but id -u returns empty', () => {
-      const result = deriveFeatureState({
-        platform: 'win32',
-        featureWsl: true,
-        featureVmp: true,
-        wslStatusCode: 0,
-        wslStatusOutput: 'Default Version: 2',
-        wslListCode: 0,
-        wslListOutput: 'Ubuntu',
-        idUCode: 0,
-        idUOutput: '', // empty output = no user
-        pendingFileRename: false,
-        cbsRebootPending: false,
-      });
-      expect(result.featureState).toBe('installed-but-not-initialized');
+  it('returns ok:false when the WMI query fails', () => {
+    mockSpawn({ status: 1, stdout: '' });
+    expect(readFeatureStates()).toEqual({
+      ok: false,
+      featureWsl: false,
+      featureVmp: false,
     });
+  });
+});
 
-    it('returns installed-but-not-initialized when no distros exist', () => {
-      const result = deriveFeatureState({
-        platform: 'win32',
-        featureWsl: true,
-        featureVmp: true,
-        wslStatusCode: 0,
-        wslStatusOutput: 'Default Version: 2',
-        wslListCode: 0,
-        wslListOutput: '',
-        idUCode: null,
-        idUOutput: '',
-        pendingFileRename: false,
-        cbsRebootPending: false,
-      });
-      expect(result.featureState).toBe('installed-but-not-initialized');
-      expect(result.distros).toEqual([]);
+// ── Usable distro filtering ─────────────────────────────────────────
+
+describe('isBashCapableDistro', () => {
+  it('accepts a distro that can run bash', () => {
+    mockSpawn({ status: 0 });
+    expect(isBashCapableDistro('Ubuntu')).toBe(true);
+  });
+
+  it('rejects docker-desktop (no bash)', () => {
+    mockSpawn({ status: 1 });
+    expect(isBashCapableDistro('docker-desktop')).toBe(false);
+  });
+
+  it('rejects when the probe errors out', () => {
+    mockedSpawnSync.mockImplementation(() => {
+      throw new Error('spawn failed');
+    });
+    expect(isBashCapableDistro('Ubuntu')).toBe(false);
+  });
+});
+
+describe('hasNonRootUser', () => {
+  it('accepts a non-root uid', () => {
+    mockSpawn({ status: 0, stdout: '1000' });
+    expect(hasNonRootUser('Ubuntu')).toBe(true);
+  });
+
+  it('rejects root (uid 0)', () => {
+    mockSpawn({ status: 0, stdout: '0' });
+    expect(hasNonRootUser('Ubuntu')).toBe(false);
+  });
+
+  it('rejects empty output', () => {
+    mockSpawn({ status: 0, stdout: '' });
+    expect(hasNonRootUser('Ubuntu')).toBe(false);
+  });
+
+  it('rejects a failing probe', () => {
+    mockSpawn({ status: 1, stdout: '' });
+    expect(hasNonRootUser('Ubuntu')).toBe(false);
+  });
+});
+
+// ── Kernel install post-checks ──────────────────────────────────────
+
+describe('wslStatusWorks', () => {
+  it('reflects the wsl --status exit code', () => {
+    mockSpawn({ status: 0 });
+    expect(wslStatusWorks()).toBe(true);
+    mockSpawn({ status: 1 });
+    expect(wslStatusWorks()).toBe(false);
+  });
+});
+
+describe('wslPackageInstalled', () => {
+  it('detects the WSL app package via Get-AppxPackage', () => {
+    mockSpawn({ status: 0, stdout: 'MicrosoftCorporationII.WindowsSubsystemForLinux' });
+    expect(wslPackageInstalled()).toBe(true);
+  });
+
+  it('reports absent when the query returns nothing', () => {
+    mockSpawn({ status: 0, stdout: '' });
+    expect(wslPackageInstalled()).toBe(false);
+  });
+});
+
+describe('wslKernelPresent', () => {
+  it('accepts the first probe when wsl --status works', () => {
+    mockSpawn({ status: 0 });
+    expect(wslKernelPresent(3, 0)).toBe(true);
+    expect(mockedSpawnSync).toHaveBeenCalledTimes(1);
+  });
+
+  it('accepts the Appx package probe when wsl --status fails', () => {
+    mockedSpawnSync
+      .mockReturnValueOnce(spawnResult({ status: 1 }))
+      .mockReturnValueOnce(spawnResult({ status: 0, stdout: 'MicrosoftCorporationII.WSL' }));
+    expect(wslKernelPresent(3, 0)).toBe(true);
+  });
+
+  it('retries before giving up (registration lag)', () => {
+    mockSpawn({ status: 1, stdout: '' });
+    expect(wslKernelPresent(2, 0)).toBe(false);
+    // Two probes per attempt.
+    expect(mockedSpawnSync).toHaveBeenCalledTimes(4);
+  });
+});
+
+// ── Elevated run trampoline ─────────────────────────────────────────
+
+describe('decodeWslOutput', () => {
+  it('decodes BOM-prefixed UTF-16LE output', () => {
+    expect(decodeWslOutput(Buffer.from('﻿安装失败', 'utf16le'))).toBe('安装失败');
+  });
+
+  it('decodes UTF-16LE without a BOM (wsl.exe writes NUL bytes)', () => {
+    expect(decodeWslOutput(Buffer.from('Invalid command line option', 'utf16le'))).toBe(
+      'Invalid command line option'
+    );
+  });
+
+  it('decodes UTF-16LE coded CJK without a BOM (no NUL bytes to detect)', () => {
+    expect(decodeWslOutput(Buffer.from('系统找不到指定的文件。', 'utf16le'))).toBe(
+      '系统找不到指定的文件。'
+    );
+  });
+
+  it('decodes plain UTF-8 output', () => {
+    expect(decodeWslOutput(Buffer.from('plain text'))).toBe('plain text');
+  });
+
+  it('treats empty input as empty', () => {
+    expect(decodeWslOutput(null)).toBe('');
+    expect(decodeWslOutput(Buffer.alloc(0))).toBe('');
+  });
+});
+
+describe('summarizeElevated', () => {
+  it('surfaces the trampoline error for unknown results', () => {
+    expect(
+      summarizeElevated({ kind: 'unknown', exitCode: null, output: '', error: 'spawn ENOENT' })
+    ).toBe('spawn ENOENT');
+  });
+
+  it('combines exit code and output for failed results', () => {
+    const summary = summarizeElevated({
+      kind: 'failed',
+      exitCode: 1,
+      output: 'WSL 内核更新失败\n更多信息请访问 https://aka.ms/wsl2kernel',
+    });
+    expect(summary).toContain('退出码 1');
+    expect(summary).toContain('WSL 内核更新失败');
+  });
+
+  it('omits a zero exit code — in a failure path it explains nothing', () => {
+    expect(summarizeElevated({ kind: 'ok', exitCode: 0, output: '拒绝访问: 需要管理员权限' })).toBe(
+      '拒绝访问: 需要管理员权限'
+    );
+  });
+
+  it('returns 无输出 when nothing at all was captured', () => {
+    expect(summarizeElevated({ kind: 'failed', exitCode: null, output: '' })).toBe('无输出');
+  });
+});
+
+describe('classifyKernelInstall', () => {
+  const failed = { kind: 'failed' as const, exitCode: 1, output: 'boom' };
+  const ok = { kind: 'ok' as const, exitCode: 0, output: '' };
+  const cancelled = { kind: 'cancelled' as const, exitCode: null, output: '' };
+
+  it('trusts system state over a non-zero exit code', () => {
+    expect(classifyKernelInstall(failed, true)).toEqual({ status: 'installed' });
+  });
+
+  it('treats exit code 0 as installed even when the probe lags', () => {
+    expect(classifyKernelInstall(ok, false)).toEqual({ status: 'installed' });
+  });
+
+  it('reports a declined UAC prompt as cancelled', () => {
+    expect(classifyKernelInstall(cancelled, false)).toEqual({ status: 'cancelled' });
+  });
+
+  it('reports the exit code and output when the install really failed', () => {
+    expect(classifyKernelInstall(failed, false)).toEqual({
+      status: 'failed',
+      detail: expect.stringContaining('退出码 1'),
     });
   });
 
-  describe('feature state: ready', () => {
-    it('returns ready when distro is initialized (id -u returns valid uid)', () => {
-      const result = deriveFeatureState({
-        platform: 'win32',
-        featureWsl: true,
-        featureVmp: true,
-        wslStatusCode: 0,
-        wslStatusOutput: 'Default Version: 2\nDefault Distribution: Ubuntu',
-        wslListCode: 0,
-        wslListOutput: 'Ubuntu',
-        idUCode: 0,
-        idUOutput: '1000',
-        pendingFileRename: false,
-        cbsRebootPending: false,
-      });
-      expect(result.featureState).toBe('ready');
-      expect(result.installed).toBe(true);
+  it('reports the transport error when the trampoline itself failed', () => {
+    expect(
+      classifyKernelInstall({ kind: 'unknown', exitCode: null, output: '', error: 'EPERM' }, false)
+    ).toEqual({ status: 'failed', detail: 'EPERM' });
+  });
+});
+
+describe('runElevated', () => {
+  function mockFiles(files: {
+    out?: string | Buffer;
+    err?: string;
+    exit?: string;
+    trampoline?: string;
+  }) {
+    mockedReadFileSync.mockImplementation(((p: string) => {
+      const name = String(p);
+      const out = files.out;
+      if (name.endsWith('out.txt') && out !== undefined) {
+        return Buffer.isBuffer(out) ? out : Buffer.from(out);
+      }
+      if (name.endsWith('err.txt') && files.err !== undefined) return Buffer.from(files.err);
+      if (name.endsWith('exit.txt') && files.exit !== undefined) return Buffer.from(files.exit);
+      if (name.endsWith('trampoline.txt') && files.trampoline !== undefined) {
+        return Buffer.from(files.trampoline);
+      }
+      throw new Error(`ENOENT: ${name}`);
+    }) as any);
+  }
+
+  /** The PowerShell script runElevated asked Windows to run elevated. */
+  function elevatedScript(): string {
+    const args = (mockedSpawnSync.mock.calls.at(-1) as any[])[1] as string[];
+    const outer = Buffer.from(args[args.indexOf('-EncodedCommand') + 1], 'base64').toString(
+      'utf16le'
+    );
+    const inner = outer.match(/-EncodedCommand','([A-Za-z0-9+/=]+)'/);
+    expect(inner).not.toBeNull();
+    return Buffer.from(inner![1], 'base64').toString('utf16le');
+  }
+
+  it('reports ok when the elevated process exited 0', () => {
+    mockFiles({ out: 'installed', exit: '0' });
+    mockSpawn({ status: 0 });
+    expect(runElevated({ command: { file: 'wsl.exe', args: ['--install'] } })).toEqual({
+      kind: 'ok',
+      exitCode: 0,
+      output: 'installed',
     });
   });
 
-  describe('reboot detection', () => {
-    it('detects reboot via PendingFileRenameOperations', () => {
-      const result = deriveFeatureState({
-        platform: 'win32',
-        featureWsl: true,
-        featureVmp: true,
-        wslStatusCode: 0,
-        wslStatusOutput: 'Default Version: 2',
-        wslListCode: 0,
-        wslListOutput: 'Ubuntu',
-        idUCode: 0,
-        idUOutput: '1000',
-        pendingFileRename: true,
-        cbsRebootPending: false,
-      });
-      expect(result.rebootRequired).toBe(true);
-      expect(result.featureState).toBe('ready'); // state is ready but reboot needed
-    });
+  it('reports failed with the recovered exit code and output', () => {
+    mockFiles({ out: Buffer.from('内核更新失败', 'utf16le'), exit: '1' });
+    mockSpawn({ status: 0 });
+    const r = runElevated({ command: { file: 'wsl.exe' } });
+    expect(r.kind).toBe('failed');
+    expect(r.exitCode).toBe(1);
+    expect(r.output).toBe('内核更新失败');
+    expect(summarizeElevated(r)).toContain('退出码 1');
+  });
 
-    it('detects reboot via CBS RebootPending', () => {
-      const result = deriveFeatureState({
-        platform: 'win32',
-        featureWsl: true,
-        featureVmp: true,
-        wslStatusCode: 0,
-        wslStatusOutput: 'Default Version: 2',
-        wslListCode: 0,
-        wslListOutput: 'Ubuntu',
-        idUCode: 0,
-        idUOutput: '1000',
-        pendingFileRename: false,
-        cbsRebootPending: true,
-      });
-      expect(result.rebootRequired).toBe(true);
-    });
+  it('merges stderr into the captured output', () => {
+    mockFiles({ err: '拒绝访问', exit: '1' });
+    mockSpawn({ status: 0 });
+    expect(runElevated({ command: { file: 'wsl.exe' } }).output).toBe('拒绝访问');
+  });
 
-    it('no reboot when both flags are false', () => {
-      const result = deriveFeatureState({
-        platform: 'win32',
-        featureWsl: true,
-        featureVmp: true,
-        wslStatusCode: 0,
-        wslStatusOutput: 'Default Version: 2',
-        wslListCode: 0,
-        wslListOutput: 'Ubuntu',
-        idUCode: 0,
-        idUOutput: '1000',
-        pendingFileRename: false,
-        cbsRebootPending: false,
-      });
-      expect(result.rebootRequired).toBe(false);
+  it('reports cancelled when the trampoline exits with ERROR_CANCELLED', () => {
+    mockFiles({});
+    mockSpawn({ status: ELEVATION_CANCELLED });
+    expect(runElevated({ command: { file: 'wsl.exe' } })).toEqual({
+      kind: 'cancelled',
+      exitCode: null,
+      output: '',
     });
   });
 
-  describe('partial feature enablement', () => {
-    it('returns not-enabled when only WSL feature is on but VMP is off', () => {
-      // With one feature on but the other off, featureState should NOT be not-installed
-      const result = deriveFeatureState({
-        platform: 'win32',
-        featureWsl: true,
-        featureVmp: false,
-        wslStatusCode: 1, // wsl not working because VMP missing
-        wslStatusOutput: '',
-        wslListCode: null,
-        wslListOutput: '',
-        idUCode: null,
-        idUOutput: '',
-        pendingFileRename: false,
-        cbsRebootPending: false,
-      });
-      // With features partially enabled and wsl not found, it falls through:
-      // featureWsl true → isWslPresent=no → featureState !== 'not-enabled' →
-      // featureWsl || featureVmp → 'not-installed'
-      expect(result.featureState).toBe('not-installed');
+  it('reports unknown with the trampoline message when no exit code was written', () => {
+    mockFiles({ trampoline: 'This operation has been cancelled' });
+    mockSpawn({ status: 99 });
+    expect(runElevated({ command: { file: 'wsl.exe' } })).toEqual({
+      kind: 'unknown',
+      exitCode: null,
+      output: '',
+      error: 'This operation has been cancelled',
     });
+  });
+
+  it('reports unknown when powershell itself cannot be spawned', () => {
+    mockFiles({});
+    mockSpawn({ error: new Error('spawn powershell.exe ENOENT') as any, status: null });
+    expect(runElevated({ command: { file: 'wsl.exe' } })).toMatchObject({
+      kind: 'unknown',
+      error: 'spawn powershell.exe ENOENT',
+    });
+  });
+
+  it('delivers the payload as an encoded command line, never as a %TEMP% script', () => {
+    mockFiles({ exit: '0' });
+    mockSpawn({ status: 0 });
+    runElevated({ command: { file: 'wsl.exe', args: ['--install', '--no-distribution'] } });
+
+    // Nothing executable may be written to the user-writable temp dir: a
+    // same-user process could replace it before the UAC-elevated launch.
+    expect(mockedWriteFileSync).not.toHaveBeenCalled();
+
+    const script = elevatedScript();
+    expect(script).toContain("Start-Process -FilePath 'wsl.exe'");
+    expect(script).toContain("-ArgumentList @('--install','--no-distribution')");
+    expect(script).toContain('-RedirectStandardOutput');
+  });
+
+  it('omits -ArgumentList when the command has no arguments', () => {
+    // Start-Process rejects an empty @() with a parameter binding error.
+    mockFiles({ exit: '0' });
+    mockSpawn({ status: 0 });
+    runElevated({ command: { file: 'wsl.exe' } });
+    expect(elevatedScript()).not.toContain('-ArgumentList @()');
+  });
+
+  it('runs a powershell payload through the same encoded channel', () => {
+    mockFiles({ exit: '0' });
+    mockSpawn({ status: 0 });
+    runElevated({ powershell: 'Enable-WindowsOptionalFeature -Online' });
+
+    expect(mockedWriteFileSync).not.toHaveBeenCalled();
+
+    const script = elevatedScript();
+    expect(script).toContain('Enable-WindowsOptionalFeature -Online');
+    // Merging the error stream is what keeps a failed cmdlet's message visible.
+    expect(script).toContain('*>&1');
   });
 });

@@ -2,11 +2,14 @@
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
+
+if TYPE_CHECKING:
+    from miqi.providers.base import LLMProvider
 
 
 class Base(BaseModel):
@@ -448,7 +451,7 @@ class SandboxConfig(Base):
     """Sandbox isolation configuration for per-session environments."""
 
     enabled: bool = True
-    share_net: bool = False  # Allow network access inside sandbox (disabled by default for security)
+    share_net: bool = True  # Share host network with sandbox (enabled by default so pip/apt inside the sandbox can reach the network; set false for full network isolation)
     # Route system package installs (apt-get/apt/dnf/... install) to the WSL
     # distro as root instead of failing inside the unprivileged read-only
     # bwrap sandbox.  Installs persist across sessions and are immediately
@@ -528,17 +531,41 @@ class PapersToolConfig(Base):
 
 
 class MCPServerConfig(Base):
-    """MCP server connection configuration (stdio or HTTP)."""
+    """MCP server connection configuration (stdio, streamable HTTP, or SSE)."""
 
+    type: str = ""  # Transport override: "sse" | "http" | "stdio"; empty = auto (command→stdio, url→http)
     command: str = ""  # Stdio: command to run (e.g. "npx")
     args: list[str] = Field(default_factory=list)  # Stdio: command arguments
     env: dict[str, str] = Field(default_factory=dict)  # Stdio: extra env vars
-    url: str = ""  # HTTP: streamable HTTP endpoint URL
-    headers: dict[str, str] = Field(default_factory=dict)  # HTTP: Custom HTTP Headers
+    url: str = ""  # HTTP/SSE: endpoint URL
+    headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: Custom HTTP Headers
+    insecure_http: bool = False  # Explicit opt-in: allow non-loopback http:// endpoints (credentials in cleartext; platform gateway has no https yet)
     tool_timeout: int = 30  # Seconds before a tool call is cancelled
     progress_interval_seconds: int = 15  # Interval for heartbeat progress messages during long-running tool calls (0 = off)
     description: str = ""  # Description shown to LLM in the gateway entry-point tool (lazy mode)
     lazy: bool = False  # If true, register a single gateway tool instead of all tools upfront; activate on demand
+
+
+# 平台托管 slurm MCP 网关（内置默认服务器条目，2026-09-05 产品确认）：
+# 零配置预置 URL/传输/超时；凭据不入仓库（明文）——共享网关 token
+# 以 AES-256-GCM 密文存于桌面主进程（mcp-gateway-key.ts），登录时解密
+# 写入 workspace/.qraft/token.json（0600，字段 mcpGatewayKey；未来平台
+# 按用户下发时 userinfo 字段优先覆盖），Python 连接本服务器时自动注入
+# Authorization Bearer（见 _connect_one_server）。
+# insecure_http 默认 true（2026-09-10）：平台暂无 https 网关域名，上线
+# 需走明文 http；内置条目显式 opt-in（共享 token 明文传输的已知权衡，
+# 用户可改回 false 关闭）。键名含 "slurm" 使作业进入计费范围
+# （#936：RUNNING 时扣 10 分）。用户显式配置 mcp_servers（含空对象）
+# 即覆盖此默认。
+DEFAULT_MCP_SERVERS: dict = {
+    "miqroforge-slurm": {
+        "type": "sse",
+        "url": "http://124.220.57.194:9000/sse",
+        "insecure_http": True,
+        "tool_timeout": 90,
+        "description": "MiQroForge 平台托管 SLURM 集群：作业提交/状态监控/取消、分区查询、输出与文件传输",
+    },
+}
 
 
 class ObservabilityConfig(Base):
@@ -568,7 +595,13 @@ class ToolsConfig(Base):
     extra_roots: list[str] = Field(default_factory=list)  # Additional filesystem roots allowed by file tools
     auto_user_dirs: bool = True  # Auto-sense output directories the user mentions and authorize file tools for the session (#821)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
-    mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+    mcp_servers: dict[str, MCPServerConfig] = Field(
+        # validate_default 未开启：default_factory 结果不会自动校验，
+        # 这里显式构造 MCPServerConfig 实例保证类型正确。
+        default_factory=lambda: {
+            name: MCPServerConfig(**cfg) for name, cfg in DEFAULT_MCP_SERVERS.items()
+        }
+    )
 
 
 class Config(BaseSettings):
@@ -583,6 +616,12 @@ class Config(BaseSettings):
     cron: CronConfig = Field(default_factory=CronConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+    # Inert passthrough for configs written by the removed #915 points-billing
+    # gate.  Config is a BaseSettings (extra keys are forbidden), so the field
+    # must stay to keep old config.json files loadable — deleting it made
+    # load_config silently fall back to a default config (providers lost,
+    # "尚未配置模型服务" on send).  Nothing reads this value (#960).
+    billing: dict[str, object] = Field(default_factory=dict)
     # Opaque Desktop-owned settings (e.g. theme, layout).  Not validated —
     # the Desktop UI reads/writes this via config/batchWrite desktop.* paths.
     desktop: dict[str, object] = Field(default_factory=dict)
@@ -674,14 +713,30 @@ class Config(BaseSettings):
                 return spec.default_api_base
         return None
 
+    def is_builtin_activated(self, provider_name: str) -> bool:
+        """Whether a provider holds a built-in (enterprise) activation.
+
+        Tolerates all historical store shapes: missing key, legacy bool
+        (``{"deepseek": true}``) and the current dict (``{"builtin": True}``).
+        A present-but-null/string entry is treated as not activated instead
+        of crashing the decode (#929 review).
+        """
+        store = self.desktop.get("providerActivation")
+        if not isinstance(store, dict):
+            return False
+        entry = store.get(provider_name)
+        if isinstance(entry, bool):
+            return entry
+        if isinstance(entry, dict):
+            return entry.get("builtin") is True
+        return False
+
     def build_provider(self, model: str) -> "LLMProvider | None":
         """Build an LLMProvider instance for the given model string.
 
         Used by ProviderFallbackChain to construct fallback provider instances.
         Returns None if the model/provider cannot be resolved.
         """
-        from miqi.providers.base import LLMProvider  # noqa: F401 (type hint only)
-
         api_key = self.get_api_key(model)
         api_base = self.get_api_base(model)
         provider_name = self.get_provider_name(model)

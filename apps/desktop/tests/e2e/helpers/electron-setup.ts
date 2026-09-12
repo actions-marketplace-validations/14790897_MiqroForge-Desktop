@@ -11,6 +11,7 @@ import type { ElectronApplication, Page } from '@playwright/test';
 import { resolve } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import {
   existsSync,
   mkdtempSync,
@@ -82,6 +83,99 @@ export async function sendMessage(page: Page, text: string) {
   await expect(userBubbles).toHaveCount(before + 1, { timeout: 10_000 });
   await expect(userBubbles.last()).toBeVisible({ timeout: 10_000 });
   await expect(page.locator('[data-testid="chat-input-container"] textarea')).toHaveValue('');
+}
+
+/** Frontend generic message shown when a turn fails on the provider side
+ *  (rate limit / overload / transient network) — the LLM never replied. */
+export const PROVIDER_UNAVAILABLE_TEXT = '模型服务暂时不可用或过载';
+
+/**
+ * Send `text` and wait until `isDone` observes the feature under test,
+ * re-sending up to `maxAttempts` times when the turn errors with the
+ * provider-unavailable message instead.
+ *
+ * Real-LLM specs (chat-disclaimer, confirm-card-real-llm) run against the
+ * shared CI provider key; parallel jobs (macos-e2e + electron-e2e + PR
+ * runs) trigger rate limits and the turn dies with 「模型服务暂时不可用或
+ * 过载」— no reply, so the feature can never render. One resend usually
+ * lands after the burst. Returns false when every attempt ended in a
+ * provider error (or a silent timeout without reply); the caller should
+ * test.skip() then (the subject under test never got a reply, failing is
+ * pure noise).
+ */
+export async function sendUntilDoneOrProviderDown(
+  page: Page,
+  text: string,
+  isDone: () => Promise<boolean>,
+  opts: { maxAttempts?: number; perAttemptWaitMs?: number; silenceExtendMs?: number } = {}
+): Promise<boolean> {
+  const { maxAttempts = 2, perAttemptWaitMs = 150_000, silenceExtendMs = 150_000 } = opts;
+  const errLocator = page.getByText(PROVIDER_UNAVAILABLE_TEXT);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // Snapshot BEFORE the send: an error that surfaces during sendMessage
+    // itself must count as this attempt's error. Error bubbles from earlier
+    // attempts stay in the message list, so match by count delta — only an
+    // error that appeared after this snapshot counts.
+    const errCountBefore = await errLocator.count();
+    await sendMessage(page, text);
+    let sawError = false;
+
+    let deadline = Date.now() + perAttemptWaitMs;
+    while (Date.now() < deadline) {
+      if (await isDone()) return true;
+      if ((await errLocator.count()) > errCountBefore) {
+        sawError = true;
+        break;
+      }
+      await page.waitForTimeout(1000);
+    }
+
+    if (!sawError) {
+      // Silence is NOT a provider error: a slow thinking model may simply not
+      // have replied yet, and re-sending would interrupt an in-flight turn.
+      // Extend the wait once instead of treating it as unavailability.
+      deadline = Date.now() + silenceExtendMs;
+      while (Date.now() < deadline) {
+        if (await isDone()) return true;
+        if ((await errLocator.count()) > errCountBefore) {
+          sawError = true;
+          break;
+        }
+        await page.waitForTimeout(1000);
+      }
+      if (!sawError) return false; // no reply and no provider error — give up
+    }
+
+    console.log(`[test] provider unavailable on attempt ${attempt}/${maxAttempts} — re-sending`);
+  }
+  return false;
+}
+
+/**
+ * 空会话不再落盘 / 不再进 sessions.list(#774)后,list[0] 不再恒等于刚打开的
+ * 当前空会话。本 helper 保证当前会话已是一条"真实"会话并返回其 key:先查
+ * list,空则发一条 seed 消息(用户消息写入即持久化,不必等 AI 回复)再轮询。
+ * 供那些"launch 后直接取 list[0].key 当当前会话"的 spec 使用。
+ */
+export async function ensurePersistedSession(
+  page: Page,
+  seedText = '请创建会话',
+  timeout = 90_000
+): Promise<string> {
+  const firstKey = async (): Promise<string | undefined> => {
+    const all = (await page.evaluate(() => (window as any).miqi.sessions.list())) as any;
+    return (all?.sessions ?? [])[0]?.key as string | undefined;
+  };
+  let key = await firstKey();
+  if (key) return key;
+  await sendMessage(page, seedText);
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    key = await firstKey();
+    if (key) return key;
+    await page.waitForTimeout(500);
+  }
+  throw new Error(`ensurePersistedSession: no session after seeding "${seedText}"`);
 }
 
 /** Wait for streaming to finish (no "Thinking…" indicator) */
@@ -177,6 +271,19 @@ export async function approveLoop(page: Page, timeout = 180_000) {
  *  UI share font-semibold.truncate on the title h2. */
 export function getSessionTitle(page: Page) {
   return page.locator('h2.font-semibold.truncate').first();
+}
+
+/** Locator for the user message bubble containing `text` (substring match).
+ *  Scoped to `[data-testid="chat-message-user"]` (not `main`) and visible-only:
+ *  the session title is auto-derived from the first user message, so the same
+ *  marker text also lives in the header's `chat-title`, which a `main`-scoped
+ *  `.first()` would hit before the message list.  The `visible: true` filter is
+ *  a defensive guard against stale/hidden nodes (#872). */
+export function userMessage(page: Page, text: string) {
+  return page
+    .locator('[data-testid="chat-message-user"]')
+    .filter({ hasText: text, visible: true })
+    .first();
 }
 
 /** Get sidebar session items (clickable buttons that switch sessions).
@@ -399,18 +506,73 @@ export interface ElectronFixture {
   miqiSessionsDir: string;
 }
 
+/**
+ * 设置页「浏览器登录」真实链路：点按钮 → 主进程打开 MiQroForge 授权窗口
+ * （独立 partition）→ 未登录被 302 到平台登录页 → 填测试账号登录 →
+ * 服务端 302 回调 redirect_uri?code → 主进程拦截 code 换 token →
+ * 应用内出现「已登录」。
+ *
+ * 凭据经环境变量注入（QRAFT_PHONE / QRAFT_PASSWORD），调用方在未登录时
+ * 才调用（dev userData 可能残留上次登录态，须先判断「已登录」徽标）。
+ * 返回授权窗口的 Page（完成时主进程会自动关闭它）。
+ *
+ * opts.entryTestId（#1000）：自定义登录按钮入口（如首屏卡片
+ * chat-hero-login-btn）——跳过设置页导航，直接点击该按钮发起登录。
+ */
+export async function browserLogin(
+  page: Page,
+  electronApp: ElectronApplication,
+  phone: string,
+  password: string,
+  opts?: { entryTestId?: string }
+): Promise<Page> {
+  if (!opts?.entryTestId) {
+    await page.getByText(/^(System Settings|系统设置)$/).click();
+    await page
+      .getByRole('tab')
+      .filter({ hasText: /MiQroForge/ })
+      .first()
+      .click();
+  }
+  const loginBtn = opts?.entryTestId
+    ? page.getByTestId(opts.entryTestId)
+    : page.getByTestId('qraft-browser-login-btn');
+  await expect(loginBtn).toBeVisible({ timeout: 15_000 });
+
+  const loginWindowPromise = electronApp.waitForEvent('window');
+  await loginBtn.click();
+  const loginWin = await loginWindowPromise;
+  await loginWin.waitForLoadState('domcontentloaded');
+
+  // 未登录 → 服务端 302 到平台登录页；已有登录态时直接进授权流程
+  await loginWin.waitForURL(/\/login/, { timeout: 30_000 }).catch(() => {
+    /* 已有登录态时直接进授权流程 */
+  });
+  await expect(loginWin.locator('#login_phone')).toBeVisible({ timeout: 30_000 });
+  await loginWin.fill('#login_phone', phone);
+  await loginWin.fill('#login_password', password);
+  await loginWin.getByRole('button', { name: /登\s*录/ }).click();
+
+  // 自定义入口（#1000）的成功态由调用方按入口断言（首屏卡片消失/顶栏账号
+  // chip 等）；设置页入口以页面上的「已登录」徽标为准。
+  if (!opts?.entryTestId) {
+    await expect(page.getByText('已登录')).toBeVisible({ timeout: 120_000 });
+  }
+  return loginWin;
+}
+
 /** Launch Electron app, wait for bridge ready, return { electronApp, page, miqiHome, miqiSessionsDir }.
  *
  *  - Creates a unique temporary MIQI_HOME so parallel test workers are fully isolated.
  *  - Strips ELECTRON_RUN_AS_NODE (inherited from Electron-based IDEs).
- *  - Waits for the MiqroForge main UI + bridge runtime.status() === 'running'.
+ *  - Waits for the MiQroForge main UI + bridge runtime.status() === 'running'.
  *  - `patchConfig` (optional) mutates the temp-home config JSON before it is
  *    written — used by specs that need a custom provider endpoint (e.g. the
  *    confirm-card spec points deepseek at a local mock OpenAI server).
  */
 export async function launchElectronApp(
   patchConfig?: (config: any) => any,
-  opts?: { bypassAll?: boolean }
+  opts?: { bypassAll?: boolean; noConsentBypass?: boolean }
 ): Promise<ElectronFixture> {
   // Create unique temporary home per test worker for full isolation.
   // Parallel workers each get their own MIQI_HOME → no race on sessions/.
@@ -431,6 +593,16 @@ export async function launchElectronApp(
   const config = existsSync(destConfigPath)
     ? JSON.parse(readFileSync(destConfigPath, 'utf-8'))
     : {};
+  // ── E2E: start from a clean provider state ──
+  // The user's real config carries desktop.providerActivation (builtin key
+  // markers). The runtime pins builtin-activated providers to their official
+  // endpoint (#933), which would silently redirect specs that patch apiBase
+  // to local mock servers (confirm-card, bridge-chinese-error, …) at the
+  // real API — mock never receives a request. Strip the markers; specs that
+  // need activation re-add it explicitly via patchConfig.
+  if (config.desktop && typeof config.desktop === 'object') {
+    delete (config.desktop as Record<string, unknown>).providerActivation;
+  }
   if (patchConfig) patchConfig(config);
   const bypassAll = opts?.bypassAll ?? true;
   if (bypassAll) {
@@ -461,11 +633,30 @@ export async function launchElectronApp(
   const env: Record<string, string | undefined> = { ...process.env };
   env.MIQI_HOME = miqiHome;
   delete env.ELECTRON_RUN_AS_NODE;
+  // Isolate the platform login store per run (#952): dev mode overrides
+  // app.getPath('userData') to a checkout-shared dir (index.ts ws-hash), so
+  // the developer machine's real qraft-auth.json leaks into every E2E app.
+  // A restored login re-syncs real gateway creds (encryptedApiKey) into the
+  // temp workspace's .qraft/token.json, which routes model calls to the real
+  // AI gateway — mock LLMs never receive a request.  Point MIQI_QRAFT_STORE
+  // at the temp home (the product already reads this env, see qraft/ipc.ts)
+  // unless a spec presets its own store (ai-gateway.spec.ts).
+  if (!env.MIQI_QRAFT_STORE) {
+    env.MIQI_QRAFT_STORE = join(miqiHome, 'qraft-auth.json');
+  }
+  // E2E default: set MIQI_E2E so the main process skips the #837 privacy-consent
+  // gate (fresh userData has no stored consent). The privacy-consent spec opts
+  // out via noConsentBypass to exercise the gate itself.
+  if (opts?.noConsentBypass) {
+    delete env.MIQI_E2E;
+  } else {
+    env.MIQI_E2E = '1';
+  }
 
   // The bridge is spawned per E2E run (cold start).  If MIQI_PYTHON_PATH
   // points at a python that cannot even run (e.g. a stale uv-managed
   // interpreter whose executable is gone), findBridgeExecutable() picks it
-  // first and the bridge dies at startup → the app shows "离线 MiqroForge 智能体"
+  // first and the bridge dies at startup → the app shows "离线 MiQroForge 智能体"
   // and never streams.  Clear it so the bridge falls back to `uv run python`
   // (which resolves the current repo's venv) and actually boots.
   if (env.MIQI_PYTHON_PATH) {
@@ -496,14 +687,14 @@ export async function launchElectronApp(
     chromiumSandbox: false,
   });
 
-  // Wait for the main window (skip splash window — 480x100, title "MiqroForge")
+  // Wait for the main window (skip splash window — 480x100, title "MiQroForge")
   let page;
   for (let i = 0; i < 100; i++) {
     const windows = electronApp.windows();
     for (const w of windows) {
       try {
         const info = await w.evaluate(() => ({ t: document.title, w: window.outerWidth }));
-        if (info.w > 500 && info.t === 'MiqroForge Desktop') {
+        if (info.w > 500 && info.t === 'MiQroForge Desktop') {
           page = w;
           break;
         }
@@ -523,12 +714,20 @@ export async function launchElectronApp(
       t.includes('[MIQI BRIDGE STDERR]') ||
       t.includes('[miqi-bridge]') ||
       t.includes('[Bridge]') ||
-      t.includes('[MiqroForge]') ||
+      t.includes('[MiQroForge]') ||
       t.includes('[e2e]')
     ) {
       console.log(`[e2e-console] ${t}`);
     }
   });
+
+  // With noConsentBypass the app is parked on the privacy-consent gate —
+  // app-title / chat input never mount, so skip the UI-readiness tail and
+  // let the spec drive the gate interaction itself.
+  if (opts?.noConsentBypass) {
+    console.log('[test] Launched with consent gate (no MIQI_E2E)');
+    return { electronApp, page, miqiHome, miqiSessionsDir };
+  }
 
   try {
     await page.getByTestId('app-title').waitFor({ timeout: 30_000 });
@@ -566,7 +765,10 @@ export async function launchElectronApp(
  *  (with its persisted config + sessions + runtime.db) instead of mkdtemp-ing
  *  a fresh one. Re-applies approval-bypass + disabled channels so the relaunched
  *  run doesn't hang on dialogs or hit real feedback channels. */
-export async function relaunchElectronApp(miqiHome: string): Promise<ElectronFixture> {
+export async function relaunchElectronApp(
+  miqiHome: string,
+  opts?: { noConsentBypass?: boolean }
+): Promise<ElectronFixture> {
   const miqiSessionsDir = getMiqiSessionsDir(miqiHome);
 
   // Re-apply the same test-safe config overrides as launchElectronApp.
@@ -585,6 +787,16 @@ export async function relaunchElectronApp(miqiHome: string): Promise<ElectronFix
   const env: Record<string, string | undefined> = { ...process.env };
   env.MIQI_HOME = miqiHome;
   delete env.ELECTRON_RUN_AS_NODE;
+  // Same #952 login-store isolation as launchElectronApp (see above).
+  if (!env.MIQI_QRAFT_STORE) {
+    env.MIQI_QRAFT_STORE = join(miqiHome, 'qraft-auth.json');
+  }
+  // Same #837 consent-gate bypass logic as launchElectronApp (see above).
+  if (opts?.noConsentBypass) {
+    delete env.MIQI_E2E;
+  } else {
+    env.MIQI_E2E = '1';
+  }
   // Same broken-MIQI_PYTHON_PATH fallback as launchElectronApp (see above).
   if (env.MIQI_PYTHON_PATH) {
     const relaunchProbe = require('node:child_process').spawnSync(
@@ -618,7 +830,7 @@ export async function relaunchElectronApp(miqiHome: string): Promise<ElectronFix
     for (const w of windows) {
       try {
         const info = await w.evaluate(() => ({ t: document.title, w: window.outerWidth }));
-        if (info.w > 500 && info.t === 'MiqroForge Desktop') {
+        if (info.w > 500 && info.t === 'MiQroForge Desktop') {
           page = w;
           break;
         }
@@ -637,12 +849,18 @@ export async function relaunchElectronApp(miqiHome: string): Promise<ElectronFix
       t.includes('[MIQI BRIDGE STDERR]') ||
       t.includes('[miqi-bridge]') ||
       t.includes('[Bridge]') ||
-      t.includes('[MiqroForge]') ||
+      t.includes('[MiQroForge]') ||
       t.includes('[e2e]')
     ) {
       console.log(`[e2e-console] ${t}`);
     }
   });
+
+  // Same as launchElectronApp: parked on the consent gate, no UI tail.
+  if (opts?.noConsentBypass) {
+    console.log('[test] Relaunched with consent gate (no MIQI_E2E)');
+    return { electronApp, page, miqiHome, miqiSessionsDir };
+  }
 
   try {
     await page.getByTestId('app-title').waitFor({ timeout: 30_000 });
@@ -693,7 +911,21 @@ export async function closeElectronApp(
       (async () => {
         await new Promise((r) => setTimeout(r, 15_000));
         try {
-          app.process().kill();
+          if (process.platform === 'win32') {
+            // #959: Playwright launches Electron through a cmd.exe shell
+            // wrapper on Windows, so app.process() is the cmd wrapper —
+            // killing it alone leaves the real app main (window + bridge +
+            // children) running to pollute later runs (mcps.list hangs).
+            // taskkill /T kills the whole tree: cmd → electron main →
+            // bridge → its MCP/exec children.
+            spawnSync('taskkill', ['/F', '/T', '/PID', String(app.process().pid)], {
+              windowsHide: true,
+            });
+          } else {
+            // POSIX: no shell wrapper — the main dies, and the bridge's
+            // parent-death watchdog (#959) hard-exits within ~1-2s.
+            app.process().kill('SIGKILL');
+          }
         } catch {
           /* already gone */
         }

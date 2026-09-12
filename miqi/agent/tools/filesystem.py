@@ -366,7 +366,7 @@ def _canonicalize_wsl_mnt_path(
         raise PermissionError(
             f"路径 '{host_str}'（规范化后：'{normalized}'）解析为 '{resolved}'，"
             f"不在任何合法根目录 [{roots_str}] 内。 "
-            "如需访问，请在 MiqroForge 配置的 tools.extra_roots 中添加该目录。"
+            "如需访问，请在 MiQroForge 配置的 tools.extra_roots 中添加该目录。"
         )
 
     # Per-session isolation: when session isolation is active, a path under
@@ -1092,15 +1092,98 @@ async def _sandbox_read_file(sandbox, sandbox_path: str) -> str:
     return stdout
 
 
-async def _sandbox_write_file(sandbox, sandbox_path: str, content: str) -> None:
-    """Write content to a file inside the sandbox via run_command."""
+def bootstrap_sandbox_roots(roots: Iterable[Path] | None) -> list[str]:
+    """Create authorized roots on the host so the sandbox can bind them (#984).
+
+    A per-call rw bind is a hard ``--bind``, so a missing source fails the
+    command.  The user may name an output directory that does not exist yet
+    ("输出到 新目录"), so the FILE tools — the write channel, whose roots are
+    already whitelisted — create it first.  ``exec`` deliberately does not
+    (plan v5 §5.1): it only accepts existing roots and points the model at a
+    file tool instead.
+
+    Boundaries (plan v5 §5.1):
+      * only roots the caller already whitelisted (the bind set) — nothing
+        outside it is ever created;
+      * only absolute host paths that map into the sandbox: UNC/WSL-native
+        (``\\\\wsl$\\…``), relative and drive-relative (``C:``, ``C:relative``)
+        paths are skipped;
+      * on Windows a POSIX path is a WSL-native path, not a host path, and is
+        skipped — ``windows_path_to_mnt`` could not map it either;
+      * the ``_user_roots`` component is already gated by
+        ``tools.auto_user_dirs`` in the caller (``_effective_shared_roots``).
+
+    Returns the paths actually created (for logging and tests).
+    """
+    import os as _os
+
+    created: list[str] = []
+    for raw in roots or []:
+        try:
+            p = Path(raw)
+        except (TypeError, ValueError):
+            continue
+        s = str(p).replace("\\", "/")
+        if s.startswith("//"):
+            continue  # UNC / WSL-native — no sandbox mapping
+        # Drive-ABSOLUTE only (``C:/…``) — the same judge as
+        # ``miqi.sandbox.bwrap._host_path_to_sandbox`` (bwrap.py:79).  The
+        # drive-RELATIVE spellings Windows accepts (``C:``, ``C:relative``)
+        # mean "relative to that drive's current directory" and name no fixed
+        # root: the old ``len(s) >= 2 and s[1] == ":"`` test let them through,
+        # so bootstrap mkdir-ed a path nobody named and handed it to the
+        # sandbox as an rw bind source (review #1007).
+        if len(s) >= 3 and s[1] == ":" and s[2] in "/\\":
+            pass  # Windows drive-absolute path
+        elif s.startswith("/"):
+            if _os.name == "nt":
+                continue  # WSL-native path, invisible to the Windows host
+        else:
+            continue  # relative — never a bind source
+        try:
+            if p.exists():
+                continue
+            p.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # stdlib logger: ``%s``, not ``{}`` (str.format placeholders make
+            # logging raise TypeError internally and DROP the message).
+            _log.warning("bootstrap_sandbox_roots: cannot create %s: %s", p, exc)
+            continue
+        created.append(str(p))
+    if created:
+        _log.info("bootstrap_sandbox_roots: created %s", created)
+    return created
+
+
+async def _sandbox_write_file(
+    sandbox,
+    sandbox_path: str,
+    content: str,
+    *,
+    extra_rw_binds: Iterable[Path] | None = None,
+) -> None:
+    """Write content to a file inside the sandbox via run_command.
+
+    ``extra_rw_binds`` (#984) are the caller's authorized roots, re-opened
+    writable for this one command — without them a write under the
+    read-only ``/mnt`` fails with EROFS.
+    """
     escaped_path = sandbox_path.replace("'", "'\\''")
+    # #984: compute the parent directory in Python.  The previous form
+    # ``mkdir -p '$(dirname "…")'`` kept the substitution inside SINGLE
+    # quotes, so bash created a literal directory named ``$(dirname "…")``
+    # and the redirect below failed with rc=1 for every new subdirectory.
+    # Do NOT move the outer quotes to double quotes: a Windows directory
+    # name containing $ or ` would then become command substitution.
+    parent = sandbox_path.rsplit("/", 1)[0] if "/" in sandbox_path else "."
+    escaped_parent = parent.replace("'", "'\\''") or "."
     # Use base64 encoding to safely transfer content through shell
     import base64
     encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
     rc, _, stderr = await sandbox.run_command(
-        f"mkdir -p '$(dirname \"{escaped_path}\")' && "
-        f"echo '{encoded}' | base64 -d > '{escaped_path}'"
+        f"mkdir -p '{escaped_parent}' && "
+        f"echo '{encoded}' | base64 -d > '{escaped_path}'",
+        extra_rw_binds=[str(r) for r in (extra_rw_binds or [])] or None,
     )
     if rc != 0:
         raise IOError(f"Cannot write {sandbox_path}: {stderr}")
@@ -1444,8 +1527,18 @@ class WriteFileTool(Tool):
         # Session isolation: new files written under the default workspace
         # root (the dir the system prompt advertises) land in the session
         # files dir instead of the shared root.
+        requested_path = path
         path = await _redirect_new_file_write(
             path, base_ws, session_dir, _make_exists_check(shared, sandbox, session_ws, native_base_dir=self._workspace),
+        )
+        # Delivery truthfulness (miqibug 路径归一化): when an absolute write
+        # is normalized into the session files dir, the success message must
+        # state BOTH paths so the model relays the REAL location to the user
+        # instead of echoing the requested one.
+        _redirected_note = (
+            f"（请求路径 {requested_path} 已按会话隔离归一化到会话 files 目录）"
+            if path != requested_path and _is_absolute_host_path(requested_path)
+            else ""
         )
         # Write authorization card (issue #864): when the resolved target is
         # outside every legal write root, offer [允许本次 / 本目录不再询问 /
@@ -1468,6 +1561,9 @@ class WriteFileTool(Tool):
         )
         if authorized is not None:
             shared = authorized
+        # #984: the sandbox binds these roots with a hard --bind, so a
+        # not-yet-created output dir must exist on the host first.
+        bootstrap_sandbox_roots(shared)
         if sandbox is not None and getattr(sandbox, "_use_wsl", False):
             # WSL sandbox — route file operations through the sandbox.
             # session_files_dir enforces cross-session isolation: a path
@@ -1478,7 +1574,9 @@ class WriteFileTool(Tool):
             )
             _log.info("write_file [sandbox]: %s → %s", path, sandbox_path)
             try:
-                await _sandbox_write_file(sandbox, sandbox_path, content)
+                await _sandbox_write_file(
+                    sandbox, sandbox_path, content, extra_rw_binds=shared,
+                )
             except IOError as e:
                 return f"Error: 沙箱中写入文件失败（path={sandbox_path}）：{e}"
             except Exception as e:
@@ -1504,7 +1602,7 @@ class WriteFileTool(Tool):
                 self._tracking_workspace, host_path, op="write", session_key=_sess_key,
             )
 
-            return f"Successfully wrote {len(content)} bytes to {host_path}"
+            return f"Successfully wrote {len(content)} bytes to {host_path}{_redirected_note}"
         else:
             # Native sandbox or no sandbox — use local filesystem
             try:
@@ -1524,7 +1622,7 @@ class WriteFileTool(Tool):
                 _persist_tracked_file(
                     self._tracking_workspace, file_path, op="write", session_key=_sess_key,
                 )
-                result = f"Successfully wrote {len(content)} bytes to {file_path}"
+                result = f"Successfully wrote {len(content)} bytes to {file_path}{_redirected_note}"
                 if not snap_ok:
                     _log.warning("Snapshot failed for %s — revert will not be available", file_path)
                 return result
@@ -1674,8 +1772,17 @@ class EditFileTool(Tool):
                 return _pre_err
         # Session isolation: edits of files that only exist in the session
         # dir resolve there; shared root files are edited in place.
+        requested_path = path
         path = await _redirect_new_file_write(
             path, base_ws, session_dir, _make_exists_check(shared, sandbox, session_ws, native_base_dir=self._workspace),
+        )
+        # Delivery truthfulness (miqibug 路径归一化): when an absolute edit
+        # is normalized into the session files dir, the success message must
+        # state BOTH paths so the model relays the REAL location.
+        _redirected_note = (
+            f"（请求路径 {requested_path} 已按会话隔离归一化到会话 files 目录）"
+            if path != requested_path and _is_absolute_host_path(requested_path)
+            else ""
         )
         # Write authorization card (issue #864).
         authorized = await _resolve_write_shared_roots(
@@ -1692,6 +1799,8 @@ class EditFileTool(Tool):
         )
         if authorized is not None:
             shared = authorized
+        # #984: create authorized roots before the sandbox binds them.
+        bootstrap_sandbox_roots(shared)
         if sandbox is not None and getattr(sandbox, "_use_wsl", False):
             # WSL sandbox — route file operations through the sandbox.
             # session_files_dir enforces cross-session isolation: a path
@@ -1723,7 +1832,9 @@ class EditFileTool(Tool):
 
             new_content = content.replace(old_text, new_text, 1)
             try:
-                await _sandbox_write_file(sandbox, sandbox_path, new_content)
+                await _sandbox_write_file(
+                    sandbox, sandbox_path, new_content, extra_rw_binds=shared,
+                )
             except Exception as e:
                 return f"Error: 沙箱中写入编辑后文件失败（path={sandbox_path}）：{type(e).__name__}：{e}"
 
@@ -1744,7 +1855,7 @@ class EditFileTool(Tool):
                 self._tracking_workspace, host_path, op="edit", session_key=_sess_key,
             )
 
-            return f"Successfully edited {host_path}"
+            return f"Successfully edited {host_path}{_redirected_note}"
         else:
             # Native sandbox or no sandbox — use local filesystem
             try:
@@ -1779,7 +1890,7 @@ class EditFileTool(Tool):
                     self._tracking_workspace, file_path, op="edit", session_key=_sess_key,
                 )
 
-                return f"Successfully edited {file_path}"
+                return f"Successfully edited {file_path}{_redirected_note}"
             except PermissionError as e:
                 return f"Error: 权限被拒绝：{e}"
             except Exception as e:

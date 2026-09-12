@@ -20,7 +20,6 @@ from typing import Any
 
 from loguru import logger
 
-
 CHAT_DRAIN_IDLE_TIMEOUT_SECONDS = 600
 
 # #798: the frontend watchdog reports "后端 60s 无响应" after 60s without
@@ -317,6 +316,12 @@ class BridgeRuntimeLoop:
             "sandbox.setEnabled", self._sandbox_set_enabled_handler,
         )
 
+        # Register #854: allow_system_installs runtime toggle (no restart)
+        self._app_server.register_method(
+            "sandbox.setAllowSystemInstalls",
+            self._sandbox_set_allow_system_installs_handler,
+        )
+
         # Register Phase 27.3: chat.send through AppServer
         self._app_server.register_method("chat.send", self._chat_send_handler)
 
@@ -494,15 +499,17 @@ class BridgeRuntimeLoop:
 
         # Register Phase 35.2: providers.* handlers
         from miqi.runtime.provider_handlers import (
+            providers_activate_handler,
+            providers_deactivate_handler,
             providers_list_handler,
             providers_test_handler,
             providers_update_handler,
-            providers_activate_handler,
         )
         self._app_server.register_method("providers.list", providers_list_handler)
         self._app_server.register_method("providers.test", providers_test_handler)
         self._app_server.register_method("providers.update", providers_update_handler)
         self._app_server.register_method("providers.activate", providers_activate_handler)
+        self._app_server.register_method("providers.deactivate", providers_deactivate_handler)
 
         # Register Phase 35.2: channels.* handlers
         from miqi.runtime.channel_handlers import (
@@ -961,7 +968,7 @@ class BridgeRuntimeLoop:
                 # Parse document and extract text (offload to thread to avoid
                 # blocking the persistent bridge event-loop).
                 try:
-                    from miqi.documents.document_parser import parse_document, is_supported_document
+                    from miqi.documents.document_parser import is_supported_document, parse_document
                     if is_supported_document(dest):
                         await _emit_doc_progress(name, "extracting", "Extracting text...")
                         result = await _asyncio.to_thread(parse_document, dest, max_chars=100_000)
@@ -1077,7 +1084,6 @@ class BridgeRuntimeLoop:
         self._app_server.subscribe(client_id, runtime_id)
 
         # Spawn background drain task
-        app_server = self._app_server
         task = asyncio.create_task(
             self._drain_chat_events(
                 request_id=request_id,
@@ -1189,8 +1195,13 @@ class BridgeRuntimeLoop:
             data: Any,
             *,
             refresh_activity: bool = True,
-        ) -> None:
-            """Emit a non-terminal event through AppServer fanout."""
+        ) -> int:
+            """Emit a non-terminal event through AppServer fanout.
+
+            Returns the number of clients the event was handed off to
+            (0 = silently skipped) — delivery-sensitive callers (billing)
+            treat a zero as a failed handoff.
+            """
             # Inject session_key so the frontend can filter events
             # by session, preventing cross-session message leaks (#212).
             if isinstance(data, dict):
@@ -1204,7 +1215,7 @@ class BridgeRuntimeLoop:
                 active = self._session_drain_tasks.get(session_id)
                 if active is not None and not active.done():
                     active._miqi_last_activity = time.monotonic()
-            await app_server.emit_event(
+            return await app_server.emit_event(
                 session_id, event_type, data,
                 request_id=request_id,
             )
@@ -1247,6 +1258,22 @@ class BridgeRuntimeLoop:
                 await _emit("user_input_requested", payload)
 
             set_user_input_emitter(session_key, _user_input_emitter)
+
+            # Slurm MCP 计费握手（issue #927）：MCP 工具执行前经此通道向
+            # Desktop 发起扣费请求；作业提交成功后回传作业 ID 补进历史。
+            from miqi.agent.billing_resolver import set_billing_charge_emitter
+
+            async def _billing_charge_emitter(payload: dict) -> int:
+                # 返回送达的客户端数：MCP 工具侧据此决定是否标记作业已
+                # 报告（0 送达不标记，下一次 RUNNING 轮询重试）。
+                return await _emit("slurm_job_running", payload)
+
+            # 双键注册：MCP 工具侧拿到的 _session_key 是 client 前缀的
+            # session_id（f"{client_id}:{session_key}"），与 drain 的
+            # session_key 不是同一个键——两个键都注册才能命中。
+            set_billing_charge_emitter(session_key, _billing_charge_emitter)
+            set_billing_charge_emitter(session_id, _billing_charge_emitter)
+
             from miqi.agent.user_input_resolver import set_thread_session
 
             set_thread_session(thread_id, session_key)
@@ -1317,6 +1344,8 @@ class BridgeRuntimeLoop:
                     }
                     if event.reasoning:
                         final_payload["reasoning"] = event.reasoning
+                    if event.reasoning_elapsed_s is not None:
+                        final_payload["reasoning_elapsed_s"] = event.reasoning_elapsed_s
                     await _emit_terminal("final", final_payload)
                     # Do NOT break — consume the TurnCompleteEvent that
                     # follows so the next drain task starts with a clean queue.
@@ -1493,10 +1522,26 @@ class BridgeRuntimeLoop:
                 "Agent control not initialized", code="INTERNAL",
             )
 
+        # #984 review: the roots a sub-agent runs with feed two authorization
+        # channels — the sandbox rw binds and the command guard's write scope
+        # — so they must come from state the SERVER holds, never from the
+        # request.  ``params`` is caller-supplied and therefore forgeable: a
+        # request field is a request, not a grant.  Filtering it (rather than
+        # dropping it) would still leave the caller choosing the scope.
+        #
+        # This channel currently has no server-side root store (the parent
+        # turn's authorized roots are not recorded per session/turn), so the
+        # sub-agent gets none: fail closed.  Wiring the parent turn's roots in
+        # is a new capability — it needs that store first — and is tracked
+        # separately from this fix.  The model-side ``spawn`` tool is not
+        # affected: it carries ``_user_roots`` through the harness-only
+        # ``extra`` channel, which ToolRegistry strips from model-authored
+        # params.
         agent = await ac.spawn(
             agent_type=params.get("agent_type", "code-agent"),
             task=params.get("task", ""),
             label=params.get("label"),
+            user_roots=None,
         )
         return {"result": {"agent_id": agent.agent_id, "thread_id": agent.thread_id}}
 
@@ -1596,11 +1641,7 @@ class BridgeRuntimeLoop:
         AppServer.dispatch() on the persistent loop.
         For legacy methods, call the sync dispatch function directly.
         """
-        dispatch_legacy = self._dispatch_legacy
-        app_server = self._app_server
-        send = self._send
         queue = self._stdin_queue
-        conn_state = self._connection_state
         if queue is None:
             logger.error("BridgeRuntimeLoop: stdin queue not initialized")
             return
@@ -1883,7 +1924,7 @@ class BridgeRuntimeLoop:
             sb_cfg = getattr(config.tools, "sandbox", None)
             new_mgr = SandboxManager(
                 workspace=config.workspace_path,
-                share_net=getattr(sb_cfg, "share_net", False),
+                share_net=getattr(sb_cfg, "share_net", True),
                 enabled=True,
                 max_sandboxes=getattr(sb_cfg, "max_sandboxes", 10),
                 auto_cleanup=getattr(sb_cfg, "auto_cleanup", True),
@@ -1922,6 +1963,77 @@ class BridgeRuntimeLoop:
                 "(client={})", destroyed, client_id,
             )
             return {"result": {"enabled": False, "destroyed": destroyed}}
+
+    async def _sandbox_set_allow_system_installs_handler(
+        self, request_id: str, params: dict, client_id: str,
+        session_id: str | None, registry: Any,
+    ) -> dict:
+        """#854: sandbox.setAllowSystemInstalls — runtime toggle, no restart.
+
+        统一入口（外部审阅 #854；#875 review 09-02 P2 修订）：runtime 属性
+        与 config 持久化原子成对——与确认卡「允许并记住」共享
+        ``apply_system_installs_toggle``（同一实现防止行为漂移）；本 handler
+        额外刷新 bridge 内存态，失败按 fail-closed 抛 AppServerError（设置页
+        UI 语义：开关不得停留在"已开启"而实际未生效）。
+        """
+        if not isinstance(params, dict):
+            from miqi.runtime.app_server import AppServerError
+
+            raise AppServerError(
+                "sandbox.setAllowSystemInstalls: params must be an object",
+                code="INVALID_PARAMS",
+            )
+        enabled = params.get("enabled")
+        if not isinstance(enabled, bool):
+            from miqi.runtime.app_server import AppServerError
+
+            raise AppServerError(
+                "sandbox.setAllowSystemInstalls: 'enabled' must be a boolean",
+                code="INVALID_PARAMS",
+            )
+        if self._bridge_state is None:
+            from miqi.runtime.app_server import AppServerError
+
+            raise AppServerError(
+                "Bridge state not available", code="INTERNAL",
+            )
+
+        # 统一入口（外部审阅 #854；#875 review 09-02 P2）：与确认卡
+        # 「允许并记住」共享 apply_system_installs_toggle——config 持久化
+        # （共享锁 fresh-read，与卡 approver、extra-root persister 同一把锁）
+        # 在前、runtime 切换在后（fail-closed），两条路径同一实现。
+        from miqi.runtime.tool_registry_factory import apply_system_installs_toggle
+
+        mgr = getattr(self._bridge_state, "_sandbox_manager", None)
+        persist_failed, runtime_failed = apply_system_installs_toggle(
+            enabled, None if mgr == "disabled" else mgr,
+        )
+        if persist_failed:
+            logger.error("sandbox.setAllowSystemInstalls: config save failed")
+            from miqi.runtime.app_server import AppServerError
+
+            raise AppServerError(
+                "Failed to save config", code="INTERNAL",
+            )
+        if runtime_failed:
+            # #875 review: config is already persisted, but the runtime
+            # toggle did NOT apply.  Returning success here would show
+            # "已开启" in the UI while the sandbox still denies installs
+            # (UI=true / config=true / runtime=false).  Surface the
+            # failure so the toggle stays off; a restart picks up the
+            # persisted config.
+            from miqi.runtime.app_server import AppServerError
+
+            raise AppServerError(
+                "Runtime update failed (config saved; restart to apply)",
+                code="INTERNAL",
+            )
+        # 刷新 bridge 内存态（save_config 已失效 loader 缓存，重新加载）
+        self._bridge_state.config = self._bridge_state.load_config()
+        logger.info(
+            "sandbox.setAllowSystemInstalls: {} (client={})", enabled, client_id,
+        )
+        return {"result": {"allowSystemInstalls": enabled}}
 
     async def _shutdown(self) -> None:
         """Graceful shutdown sequence.

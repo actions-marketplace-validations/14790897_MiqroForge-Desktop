@@ -1,8 +1,8 @@
 """Web tools: web_search and web_fetch."""
 
+import asyncio
 import html
 import ipaddress
-import asyncio
 import json
 import logging
 import os
@@ -13,10 +13,10 @@ from urllib.parse import urlparse
 
 import httpx
 
+from miqi.agent.tools.base import Tool
+
 # Suppress noisy readability tracebacks for empty/broken pages
 logging.getLogger("readability.readability").setLevel(logging.WARNING)
-
-from miqi.agent.tools.base import Tool
 
 # Shared constants
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"
@@ -165,7 +165,9 @@ class SearchResult:
 
 
 # Error categories that should trigger fallback in auto mode.
-_FALLBACK_ERRORS = {"RATE_LIMIT", "NETWORK", "SERVER_ERROR", "NO_RESULT"}
+# BALANCE_ERROR（余额不足）也回落——DeepSeek 配置了 key 但账户没钱时，
+# 用户仍应能得到搜索结果（#979：配置了不能搜索 → 自动切换兜底）。
+_FALLBACK_ERRORS = {"RATE_LIMIT", "NETWORK", "SERVER_ERROR", "NO_RESULT", "BALANCE_ERROR"}
 # Errors that must NOT silently fall back (config problems) — log, but
 # degrade to the keyless provider once so the user still gets an answer.
 _AUTH_ERRORS = {"AUTH_ERROR", "NO_KEY"}

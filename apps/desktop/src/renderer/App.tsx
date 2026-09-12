@@ -6,12 +6,17 @@ import { StatusBar } from './components/StatusBar';
 import { TopBar } from './components/TopBar';
 import { ApprovalBypassBanner } from './components/ApprovalBypassBanner';
 import { SetupWizard } from './features/setup/SetupWizard';
+import { PrivacyConsentGate } from './features/setup/PrivacyConsentGate';
+import { QraftLoginStep } from './features/setup/QraftLoginStep';
 import { ChatConsole } from './features/chat/ChatConsole';
 import { SettingsPage, type SettingsTab } from './features/settings/SettingsPage';
-import { MCPsPage } from './features/mcps/MCPsPage';
 import { ApprovalProvider } from './contexts/ApprovalContext';
 import { UserInputProvider } from './contexts/UserInputContext';
 import { RestartRequiredProvider } from './contexts/RestartRequiredContext';
+import { ConfigHotReloadListener } from './components/ConfigHotReloadListener';
+import { GatewayModelAutoSync } from './components/GatewayModelAutoSync';
+import { InstallWarningToaster } from './components/InstallWarningToaster';
+import { QraftReloginNotifier } from './components/QraftReloginNotifier';
 import { ApprovalModal } from './features/approvals/ApprovalModal';
 import { CronPage } from './features/cron/CronPage';
 import { MemoryPage } from './features/memory/MemoryPage';
@@ -25,13 +30,13 @@ import { PermissionsPage } from './features/permissions/PermissionsPage';
 import { PluginMarket } from './features/plugins/PluginMarket';
 import { SessionExplorer } from './features/sessions/SessionExplorer';
 import { WorkspacePage } from './features/workspace/WorkspacePage';
+import { PRIVACY_VERSION, isConsentCurrent, readStoredConsent, recordConsent } from './lib/privacy';
 
 type NavId =
   | 'chat'
   | 'workspace'
   | 'agents'
   | 'plan'
-  | 'mcps'
   | 'cron'
   | 'memory'
   | 'experience'
@@ -73,6 +78,14 @@ function AppShell() {
   });
   const [canSkipSetup, setCanSkipSetup] = useState(false); // true when re-running wizard from settings
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
+  // #837: 隐私协议同意门 — 同意状态本地持久化；协议版本更新时重新确认。
+  // E2E（MIQI_E2E=1 → preload 暴露 env.isE2E）跳过确认门，避免全部 E2E 被阻断。
+  const [consentVersion, setConsentVersion] = useState<string | null>(() => readStoredConsent());
+  const consentBypassed = PRELOAD_OK && window.miqi.env?.isE2E === true;
+  const consentOk = consentBypassed || isConsentCurrent(consentVersion);
+  // #1000: 同意隐私协议后衔接登录页（协议 → 登录一气呵成）。仅本次挂载内
+  // 生效：跳过或完成登录后不再出现，后续启动由首屏登录卡片承接入口。
+  const [showLoginStep, setShowLoginStep] = useState(false);
   const [workspace, setWorkspace] = useState<string | null>(null);
   const [newSessionTrigger, setNewSessionTrigger] = useState(0);
   const pendingWorkspace = useRef<{ sessionKey: string; workspace: string } | null>(null);
@@ -85,7 +98,18 @@ function AppShell() {
     hasActivityRef.current = false; // 切会话后重置活动信号
   }, [sessionKey]);
   const handleSessionActivityChange = useCallback((hasActivity: boolean) => {
+    const flipped = hasActivity && !hasActivityRef.current;
     hasActivityRef.current = hasActivity;
+    // 首条消息乐观挂载后立即刷新侧栏：会话此刻已向 bridge 落盘，但
+    // onChatFinished 要到回合结束才触发——慢模型（思考 1 分钟+）期间侧栏
+    // 会一直显示「暂无任务」，新会话卡片要等回合收尾才出现（macos-e2e
+    // session-rename 播种 60s 超时的根因）。落盘可能晚于乐观挂载一拍，
+    // 补 1.5s / 5s 两个延迟刷新兜底；都是纯读 sessions.list，无副作用。
+    if (flipped) {
+      setSessionRefreshKey((k) => k + 1);
+      window.setTimeout(() => setSessionRefreshKey((k) => k + 1), 1500);
+      window.setTimeout(() => setSessionRefreshKey((k) => k + 1), 5000);
+    }
   }, []);
   const sessionKeyRef = useRef(sessionKey);
 
@@ -118,15 +142,19 @@ function AppShell() {
   useEffect(() => {
     if (PRELOAD_OK) {
       const apiKeys = Object.keys(window.miqi).join(', ');
-      console.log(`[MiqroForge] preload OK — exposed namespaces: ${apiKeys}`);
+      console.log(`[MiQroForge] preload OK — exposed namespaces: ${apiKeys}`);
     } else {
       console.error(
-        '[MiqroForge] preload MISSING — window.miqi is undefined. ' +
+        '[MiQroForge] preload MISSING — window.miqi is undefined. ' +
           'Check that contextBridge.exposeInMainWorld executed.'
       );
       setNeedsSetup(false);
       return;
     }
+
+    // #837: consent-first — 隐私协议未同意前不启动后端、不做环境探测。
+    // consentOk 变化后（同意/绕过生效）再执行，此前门页已挡住整个应用。
+    if (!consentOk) return;
 
     const check = async () => {
       try {
@@ -147,7 +175,7 @@ function AppShell() {
       }
     };
     check();
-  }, []);
+  }, [consentOk]);
 
   const handleSetupComplete = () => {
     setNeedsSetup(false);
@@ -208,10 +236,79 @@ function AppShell() {
     setSessionRefreshKey((k) => k + 1);
   };
 
+  // Deleting the currently open session: the sidebar already removed the
+  // record + refreshed its list, but App still points sessionKey at the
+  // deleted key, so ChatConsole keeps showing its messages.  Route through
+  // the existing new-session machinery to land on a fresh empty session
+  // (which renders the welcome hero) instead of a stale deleted key.
+  const handleSessionDeleted = useCallback((key: string) => {
+    if (key !== sessionKeyRef.current) return;
+    setNewSessionTrigger((k) => k + 1);
+  }, []);
+
   const openApprovalSettings = () => {
     setSettingsTab('approvals');
     setActiveNav('settings');
   };
+
+  // Preload missing
+  if (!PRELOAD_OK) {
+    return (
+      <div
+        className="flex items-center justify-center h-screen"
+        style={{ background: 'var(--background)' }}
+      >
+        <div className="flex flex-col items-center gap-4 max-w-sm text-center px-6">
+          <div
+            className="w-12 h-12 rounded-xl flex items-center justify-center"
+            style={{ background: 'var(--danger-bg)' }}
+          >
+            <span className="text-xl font-bold" style={{ color: 'var(--danger)' }}>
+              !
+            </span>
+          </div>
+          <div>
+            <h2 className="text-base font-semibold mb-1 text-text">预加载桥接不可用</h2>
+            <p className="text-sm text-text-muted">
+              应用预加载脚本注入失败。 <br />
+              请重启应用。如问题持续，请检查预加载脚本路径或重新安装。{' '}
+            </p>
+          </div>
+          <div className="text-xs text-text-faint">按 Ctrl+Shift+I 打开 DevTools 查看错误。</div>
+        </div>
+      </div>
+    );
+  }
+
+  // Privacy consent gate (#837) — blocks the app until the current agreement
+  // version is accepted. Covers portable/zip/MSI (no NSIS license page) and
+  // upgrades of installed builds; NSIS users accept during installation and
+  // see this once more in-app for the local persistence record.
+  // 必须先于 loading 屏判定：同意前 needsSetup 恒为 null（环境探测被
+  // consent-first 挡住），先判 loading 会导致门永远不可达。
+  if (!consentOk) {
+    return (
+      <TooltipProvider>
+        <PrivacyConsentGate
+          onAgree={() => {
+            recordConsent();
+            setConsentVersion(PRIVACY_VERSION);
+            // #1000: 同意后直接衔接登录页，登录入口不再藏在设置页深处。
+            setShowLoginStep(true);
+          }}
+        />
+      </TooltipProvider>
+    );
+  }
+
+  // #1000: 协议 → 登录衔接页（可「暂不登录」跳过；已登录时展示成功态进入应用）。
+  if (showLoginStep) {
+    return (
+      <TooltipProvider>
+        <QraftLoginStep onDone={() => setShowLoginStep(false)} />
+      </TooltipProvider>
+    );
+  }
 
   // Loading state
   if (needsSetup === null) {
@@ -252,37 +349,8 @@ function AppShell() {
             M
           </div>
           <div style={{ fontSize: '13px', color: 'rgba(255,255,255,0.4)' }}>
-            Loading MiqroForge…
+            Loading MiQroForge…
           </div>
-        </div>
-      </div>
-    );
-  }
-
-  // Preload missing
-  if (!PRELOAD_OK) {
-    return (
-      <div
-        className="flex items-center justify-center h-screen"
-        style={{ background: 'var(--background)' }}
-      >
-        <div className="flex flex-col items-center gap-4 max-w-sm text-center px-6">
-          <div
-            className="w-12 h-12 rounded-xl flex items-center justify-center"
-            style={{ background: 'var(--danger-bg)' }}
-          >
-            <span className="text-xl font-bold" style={{ color: 'var(--danger)' }}>
-              !
-            </span>
-          </div>
-          <div>
-            <h2 className="text-base font-semibold mb-1 text-text">预加载桥接不可用</h2>
-            <p className="text-sm text-text-muted">
-              应用预加载脚本注入失败。 <br />
-              请重启应用。如问题持续，请检查预加载脚本路径或重新安装。{' '}
-            </p>
-          </div>
-          <div className="text-xs text-text-faint">按 Ctrl+Shift+I 打开 DevTools 查看错误。</div>
         </div>
       </div>
     );
@@ -311,11 +379,33 @@ function AppShell() {
   return (
     <TooltipProvider>
       <RestartRequiredProvider>
+        <ConfigHotReloadListener />
+        <GatewayModelAutoSync />
+        <InstallWarningToaster
+          onOpenSandboxSettings={() => {
+            setSettingsTab('general');
+            setActiveNav('settings');
+          }}
+        />
+        {/* 平台登录失效的全局告知：横幅常驻可关闭，顶栏 chip 持续提示 */}
+        <QraftReloginNotifier
+          onOpenQraft={() => {
+            setSettingsTab('qraft');
+            setActiveNav('settings');
+          }}
+        />
         <ApprovalProvider>
           <UserInputProvider>
             {/* Full-height flex column */}
             <div className="flex flex-col h-screen" style={{ background: 'var(--background)' }}>
-              <TopBar onOpenApprovals={openApprovalSettings} workspace={workspace ?? undefined} />
+              <TopBar
+                onOpenApprovals={openApprovalSettings}
+                onOpenQraft={() => {
+                  setSettingsTab('qraft');
+                  setActiveNav('settings');
+                }}
+                workspace={workspace ?? undefined}
+              />
               <ApprovalBypassBanner onOpenApprovals={openApprovalSettings} />
               {/* Body row */}
               <div className="flex flex-1 overflow-hidden">
@@ -334,6 +424,7 @@ function AppShell() {
                   refreshKey={sessionRefreshKey + runtimeReadyKey * 100000}
                   onNewSession={handleNewSession}
                   onRenamed={() => setRenameVersion((v) => v + 1)}
+                  onSessionDeleted={handleSessionDeleted}
                 />
 
                 <main
@@ -356,10 +447,15 @@ function AppShell() {
                       onSessionActivityChange={handleSessionActivityChange}
                       pendingWorkspace={pendingWorkspace}
                       onChatFinished={() => setSessionRefreshKey((k) => k + 1)}
+                      onSessionsChanged={() => setSessionRefreshKey((k) => k + 1)}
                       renameVersion={renameVersion}
                       onRename={() => setSessionRefreshKey((k) => k + 1)}
                       onOpenProviderSettings={() => {
                         setSettingsTab('providers');
+                        setActiveNav('settings');
+                      }}
+                      onOpenQraftSettings={() => {
+                        setSettingsTab('qraft');
                         setActiveNav('settings');
                       }}
                       onOpenApprovals={() => {
@@ -372,7 +468,6 @@ function AppShell() {
                     />
                   </div>
                   {activeNav === 'workspace' && <WorkspacePage />}
-                  {activeNav === 'mcps' && <SettingsPage tab="mcps" />}
                   {activeNav === 'cron' && <CronPage />}
                   {activeNav === 'memory' && <SettingsPage tab="memory" />}
                   {activeNav === 'experience' && <SettingsPage tab="experience" />}
@@ -404,7 +499,12 @@ function AppShell() {
                 </main>
               </div>
 
-              <StatusBar />
+              <StatusBar
+                onOpenPoints={() => {
+                  setSettingsTab('qraft');
+                  setActiveNav('settings');
+                }}
+              />
             </div>
             <ApprovalModal />
           </UserInputProvider>

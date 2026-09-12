@@ -8,7 +8,7 @@ Each conversation gets its own mount namespace with:
 - A writable overlay (tmpfs) for /tmp, /home/miqi/workspace
 - Read-only bind mounts for /usr, /lib, /bin, etc.
 - A per-session home directory with its own copy of the workspace
-- Network isolation (unshare-net) by default
+- Network shared with host by default (unshare-net only when share_net=False)
 - PID namespace isolation (unshare-pid)
 
 Usage:
@@ -58,6 +58,113 @@ class BwrapSandboxError(Exception):
     """Error raised when bwrap operations fail."""
 
 
+def _host_path_to_sandbox(path: str) -> str:
+    """Map a host path to the path bwrap must bind it at (#984).
+
+    ``C:\\x`` → ``/mnt/c/x``; a WSL-native path is already usable and is
+    returned unchanged.  Anything else (UNC, relative) cannot be mapped and
+    raises — a per-call writable bind must never be silently dropped, or the
+    command would run without the write access it was granted.
+
+    A drive path must be drive-ABSOLUTE (``C:/…``).  The drive-relative
+    spellings Windows accepts (``C:``, ``C:relative``) mean "relative to
+    that drive's current directory" and have no fixed sandbox target; the
+    old ``p[1] == ":"`` test mapped them to ``/mnt/c`` / ``/mnt/crelative``
+    — a bind of a path nobody named (review #1007).
+
+    Deliberately local: importing ``miqi.sandbox.manager.windows_path_to_mnt``
+    at module scope is circular (``manager`` imports this module at line 45).
+    """
+    p = str(path).replace("\\", "/")
+    if len(p) >= 3 and p[1] == ":" and p[2] in "/\\":
+        return "/mnt/" + p[0].lower() + p[2:]
+    if p.startswith("//"):
+        raise BwrapSandboxError(
+            f"Cannot bind UNC path into the sandbox: {path}"
+        )
+    if not p.startswith("/"):
+        raise BwrapSandboxError(
+            f"Cannot bind relative path into the sandbox: {path}"
+        )
+    return p
+
+
+def _bind_key(path: str) -> str:
+    """Comparison key for a bind path (``/``-joined, case-folded on Windows).
+
+    ``os.path.normcase`` is identity on POSIX (paths stay case-sensitive) and
+    lower-cases + flips separators on Windows — the same normalisation
+    ``ExecTool._exec_rw_binds`` uses to de-duplicate its bind set, so a
+    comparison here matches what actually reached the mount list.
+    """
+    return os.path.normcase(str(path)).replace("\\", "/").rstrip("/")
+
+
+def _is_same_or_ancestor(parent: str, child: str) -> bool:
+    """True when *child* is *parent* itself or lives under it.
+
+    Path-boundary aware: ``…/workspace`` is NOT an ancestor of
+    ``…/workspace-other`` (a plain ``startswith`` would say it is).
+    """
+    p = _bind_key(parent)
+    c = _bind_key(child)
+    return c == p or c.startswith(p.rstrip("/") + "/")
+
+
+def _cross_session_guard_args(
+    workspace_root: str | None,
+    session_files_dir: str | None,
+    rw_sources: list[str],
+) -> list[str]:
+    """Mount args that keep OTHER sessions' directories read-only (#1007).
+
+    Layer 1 re-opens the workspace root writable with a hard ``--bind``, and
+    ``<workspace>/sessions/**`` lives underneath it — so session A's exec
+    could write session B's files, undoing both the per-session containment
+    checks and layer 2's read-only ``/mnt``.  bwrap applies mounts in order,
+    so a later ``--ro-bind`` of ``<workspace>/sessions`` wins over the earlier
+    rw bind; the current session's own files dir is then re-opened with a
+    later ``--bind`` so normal work keeps working.
+
+    Deliberately conditional:
+
+    * only when the workspace root (or one of its ancestors) is actually in
+      the rw bind set — otherwise there is nothing to protect and the old arg
+      list is emitted unchanged;
+    * only when ``session_files_dir`` is given AND sits under
+      ``<workspace>/sessions``.  That is the per-session files layout, which
+      ``filesystem._session_files_dir_for_key`` establishes for the DEFAULT
+      workspace only; a custom workspace has no per-session files area, and
+      its ``<project>/sessions`` may be the project's own directory — turning
+      that read-only inside exec would break legitimate work.
+
+    The guard mount is ``--ro-bind-try``: it only ever NARROWS, and a missing
+    ``sessions`` dir means there are no session dirs to protect, so a hard
+    bind would fail every command for nothing.  The re-open is a hard
+    ``--bind`` and only for a path already in the rw set (an existing,
+    authorized source).
+    """
+    if not workspace_root or not session_files_dir:
+        return []
+    try:
+        ws = _host_path_to_sandbox(workspace_root)
+        own = _host_path_to_sandbox(session_files_dir)
+    except BwrapSandboxError:
+        # UNC / drive-relative / relative — not bindable, same rule the bind
+        # sources themselves follow.
+        return []
+    if not any(_is_same_or_ancestor(src, ws) for src in rw_sources):
+        return []
+    sessions = ws.rstrip("/") + "/sessions"
+    if not _is_same_or_ancestor(sessions, own):
+        return []
+    args = ["--ro-bind-try", sessions, sessions]
+    if any(_bind_key(src) == _bind_key(own) for src in rw_sources):
+        # After the ro-bind → the current session's area stays writable.
+        args.extend(["--bind", own, own])
+    return args
+
+
 _auto_install_cache: dict[str, bool] = {}
 """Cache auto-install results per distro to avoid repeated apt-get calls."""
 
@@ -105,6 +212,27 @@ apt-get processes race on the dpkg lock and one fails.  This lock
 makes the second caller wait for the first install, then re-check with
 a quick readiness probe that succeeds immediately.
 """
+
+#: Idempotent check that the distro's WSL default user is root. Prints
+#: ``ROOT_OK`` when /etc/wsl.conf already declares ``default=root``, or
+#: ``ROOT_FIXED`` after correcting it (so the caller knows to terminate
+#: the distro to apply the change). Run as root (``-u root``) so it has
+#: write access to /etc/wsl.conf regardless of the current default user.
+_WSL_ENSURE_ROOT_CMD = (
+    "if [ \"$(id -un)\" != \"root\" ]; then echo NOT_ROOT; exit 1; fi; "
+    "if grep -qF 'default=root' /etc/wsl.conf 2>/dev/null; then "
+    "echo ROOT_OK; "
+    "else "
+    "if grep -qF 'default=' /etc/wsl.conf 2>/dev/null; then "
+    "sed -i 's/^default=.*/default=root/' /etc/wsl.conf; "
+    "elif grep -qF '[user]' /etc/wsl.conf 2>/dev/null; then "
+    "sed -i '/^\\[user\\]/a default=root' /etc/wsl.conf; "
+    "else "
+    "printf '\\n[user]\\ndefault=root\\n' >> /etc/wsl.conf; "
+    "fi; "
+    "echo ROOT_FIXED; "
+    "fi"
+)
 
 
 class BwrapCommandHandle:
@@ -277,7 +405,7 @@ class BwrapSandbox:
         session_key: str,
         workspace: Path | str,
         sandbox_base_dir: Path | str | None = None,
-        share_net: bool = False,
+        share_net: bool = True,
         extra_ro_binds: list[str] | None = None,
         extra_rw_binds: list[str] | None = None,
         hostname: str = "miqi-sandbox",
@@ -772,6 +900,60 @@ class BwrapSandbox:
         except (asyncio.TimeoutError, OSError, ValueError):
             return None
     @staticmethod
+    async def _ensure_root_default_user(distro: str) -> bool:
+        """Ensure the distro's WSL default user is root (idempotent).
+
+        miqi's sandbox relies on the distro running as root so apt-get
+        and bwrap never hit a sudo password prompt. The distro's
+        /etc/wsl.conf may have been edited externally (or the distro
+        created outside miqi) to a non-root default user, which breaks
+        that assumption and makes every sandbox invocation stall on a
+        password. This corrects it and terminates the distro so the
+        change takes effect.
+
+        Returns True if a change was made (default user flipped to
+        root), False if it was already root or could not be verified.
+        """
+        try:
+            proc = await _create_subprocess_exec(
+                "wsl.exe", "-d", distro, "-u", "root", "--",
+                "bash", "-c", _WSL_ENSURE_ROOT_CMD,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout_data, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=15.0,
+            )
+        except (asyncio.TimeoutError, OSError):
+            return False
+
+        output = stdout_data.decode("utf-8", errors="replace") if stdout_data else ""
+        if proc.returncode != 0:
+            logger.warning(
+                "Failed to ensure root default user for '{}': {}",
+                distro, output.strip()[:200],
+            )
+            return False
+
+        if "ROOT_FIXED" not in output:
+            return False  # ROOT_OK (already root) or no action needed
+
+        # Terminate so wsl.conf takes effect on the next launch
+        try:
+            term = await _create_subprocess_exec(
+                "wsl.exe", "--terminate", distro,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(term.communicate(), timeout=10.0)
+        except (asyncio.TimeoutError, OSError):
+            pass
+        logger.info(
+            "Sandbox distro '{}' default user set to root", distro,
+        )
+        return True
+
+    @staticmethod
     async def _ensure_sandbox_distro(target_name: str = "AIShadowSandbox") -> bool:
         """Create a dedicated sandbox WSL distro if it does not exist.
 
@@ -795,6 +977,11 @@ class BwrapSandbox:
                 logger.info(
                     "Sandbox distro '{}' already exists", target_name,
                 )
+                # The distro may exist but with a non-root default user
+                # (e.g. /etc/wsl.conf edited externally), which would
+                # make apt-get/bwrap stall on a sudo password prompt.
+                # Enforce root even on the already-exists path.
+                await BwrapSandbox._ensure_root_default_user(target_name)
                 return True
         except (asyncio.TimeoutError, OSError):
             pass
@@ -871,29 +1058,11 @@ class BwrapSandbox:
                 )
                 return False
 
-            # Set default user to root so apt-get never needs a password
-            try:
-                set_root = await _create_subprocess_exec(
-                    "wsl.exe", "-d", target_name, "-u", "root", "--",
-                    "bash", "-c",
-                    "echo -e '[user]\\ndefault=root' > /etc/wsl.conf",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await asyncio.wait_for(
-                    set_root.communicate(), timeout=10.0,
-                )
-                # Terminate so wsl.conf takes effect on next launch
-                term = await _create_subprocess_exec(
-                    "wsl.exe", "--terminate", target_name,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await asyncio.wait_for(
-                    term.communicate(), timeout=10.0,
-                )
-            except (asyncio.TimeoutError, OSError):
-                pass  # best-effort, not fatal
+            # Set default user to root so apt-get never needs a password.
+            # Reuse the idempotent helper so the just-imported distro's
+            # wsl.conf is normalized the same way as the already-exists
+            # path above (keeps any extra [boot]/[network] sections intact).
+            await BwrapSandbox._ensure_root_default_user(target_name)
 
             logger.info(
                 "Sandbox distro '{}' created (installed at {})",
@@ -915,9 +1084,23 @@ class BwrapSandbox:
                     pass
 
     @staticmethod
+    def _is_transient_apt_error(msg: str) -> bool:
+        """apt 网络瞬断类错误（重试一次可恢复）；非瞬断错误立即失败。"""
+        low = msg.lower()
+        return any(
+            key in low
+            for key in (
+                "temporary failure resolving",
+                "could not resolve",
+                "connection timed out",
+                "network is unreachable",
+                "connection refused",
+            )
+        )
+
+    @staticmethod
     async def _ensure_wsl_deps(distro: str) -> bool:
         """Install required packages in a WSL distro and verify bwrap + Python.
-
         Installs: bubblewrap, coreutils, rsync, python3, python3-pip,
         python3-venv, unzip.
 
@@ -1064,56 +1247,66 @@ class BwrapSandbox:
             if use_sudo:
                 install_cmd = f"sudo bash -c '{install_cmd}'"
 
-            try:
-                proc = await _create_subprocess_exec(
-                    "wsl.exe", "-d", distro, "--", "bash", "-c",
-                    install_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
+            # WSL/runner 网络偶发瞬断（Temporary failure resolving）会让
+            # 安装失败——瞬断类错误重试一次，非瞬断错误立即失败。
+            for _attempt in range(2):
                 try:
-                    _stdout, stderr = await asyncio.wait_for(
-                        proc.communicate(), timeout=180.0,
+                    proc = await _create_subprocess_exec(
+                        "wsl.exe", "-d", distro, "--", "bash", "-c",
+                        install_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
                     )
-                except asyncio.TimeoutError:
-                    # Kill the wsl.exe wrapper before releasing the lock —
-                    # an orphaned apt-get would keep holding the dpkg lock
-                    # and deadlock the next installer.
                     try:
-                        proc.kill()
-                        await asyncio.wait_for(proc.wait(), timeout=5.0)
-                    except (asyncio.TimeoutError, ProcessLookupError, OSError):
-                        pass
-                    raise
-                stderr = stderr.decode("utf-8", errors="replace") if stderr else ""
-
-                if proc.returncode != 0:
-                    logger.info(
-                        "  apt-get install completed in {:.0f}s (failed)",
-                        time.monotonic() - _t0,
-                    )
-                    err_msg = stderr[:300] or "unknown error"
-                    if not use_sudo and (
-                        "permission denied" in err_msg.lower()
-                        or "are you root" in err_msg.lower()
-                    ):
-                        err_msg += (
-                            " (sudo is required but needs a password. "
-                            "Configure passwordless sudo in the WSL distro "
-                            "or run: wsl -d {0} -- sudo apt-get install "
-                            "bubblewrap python3 python3-pip)".format(distro)
+                        _stdout, stderr = await asyncio.wait_for(
+                            proc.communicate(), timeout=180.0,
                         )
+                    except asyncio.TimeoutError:
+                        # Kill the wsl.exe wrapper before releasing the lock —
+                        # an orphaned apt-get would keep holding the dpkg lock
+                        # and deadlock the next installer.
+                        try:
+                            proc.kill()
+                            await asyncio.wait_for(proc.wait(), timeout=5.0)
+                        except (asyncio.TimeoutError, ProcessLookupError, OSError):
+                            pass
+                        raise
+                    stderr = stderr.decode("utf-8", errors="replace") if stderr else ""
+
+                    if proc.returncode != 0:
+                        logger.info(
+                            "  apt-get install completed in {:.0f}s (failed, attempt {})",
+                            time.monotonic() - _t0, _attempt + 1,
+                        )
+                        err_msg = stderr[:300] or "unknown error"
+                        if not use_sudo and (
+                            "permission denied" in err_msg.lower()
+                            or "are you root" in err_msg.lower()
+                        ):
+                            err_msg += (
+                                " (sudo is required but needs a password. "
+                                "Configure passwordless sudo in the WSL distro "
+                                "or run: wsl -d {0} -- sudo apt-get install "
+                                "bubblewrap python3 python3-pip)".format(distro)
+                            )
+                        if _attempt == 0 and BwrapSandbox._is_transient_apt_error(err_msg):
+                            logger.warning(
+                                "apt install failed with transient network error, retrying once: {}",
+                                err_msg,
+                            )
+                            continue
+                        logger.warning(
+                            "Failed to install dependencies in WSL distro "
+                            "'{}': {}", distro, err_msg,
+                        )
+                        return False
+                    break
+                except (asyncio.TimeoutError, OSError) as exc:
                     logger.warning(
-                        "Failed to install dependencies in WSL distro "
-                        "'{}': {}", distro, err_msg,
+                        "Failed to run apt install in WSL distro '{}': {}",
+                        distro, exc,
                     )
                     return False
-            except (asyncio.TimeoutError, OSError) as exc:
-                logger.warning(
-                    "Failed to run apt install in WSL distro '{}': {}",
-                    distro, exc,
-                )
-                return False
         finally:
             _install_lock.release()
 
@@ -1305,8 +1498,21 @@ class BwrapSandbox:
         timeout: float = 60.0,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        extra_rw_binds: list[str] | None = None,
+        workspace_root: str | None = None,
+        session_files_dir: str | None = None,
     ) -> tuple[int, str, str]:
         """Run a command inside the bwrap sandbox.
+
+        Args:
+            extra_rw_binds: PER-CALL host paths to bind writable for this
+                command only (#984) — the session's authorized output dirs.
+                They do not modify the sandbox; see :meth:`_build_bwrap_args`.
+            workspace_root: Host path of the workspace root, when the caller
+                knows it — enables the cross-session read-only guard (#1007).
+            session_files_dir: Host path of THIS session's files dir; it is
+                re-opened writable after that guard.  Neither kwarg alone
+                disables anything else: ``None`` reproduces the old args.
 
         Returns:
             (exit_code, stdout, stderr)
@@ -1336,7 +1542,10 @@ class BwrapSandbox:
                 )
             logger.info("Sandbox directories recreated for {}", self.session_key)
 
-        bwrap_args = self._build_bwrap_args(command, env=env, cwd=cwd)
+        bwrap_args = self._build_bwrap_args(
+            command, env=env, cwd=cwd, extra_rw_binds=extra_rw_binds,
+            workspace_root=workspace_root, session_files_dir=session_files_dir,
+        )
 
         exit_code = -1
         stdout = ""
@@ -1433,6 +1642,9 @@ class BwrapSandbox:
         command: str,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        extra_rw_binds: list[str] | None = None,
+        workspace_root: str | None = None,
+        session_files_dir: str | None = None,
     ) -> BwrapCommandHandle:
         """Run a command inside the bwrap sandbox with streaming I/O.
 
@@ -1448,6 +1660,11 @@ class BwrapSandbox:
         The caller also owns timeout and cancellation — use
         :meth:`BwrapCommandHandle.kill` to stop a running command.
 
+        ``extra_rw_binds`` are per-call writable host paths (#984), same
+        semantics as :meth:`run_command`; ``workspace_root`` /
+        ``session_files_dir`` feed the cross-session read-only guard
+        (#1007 review), same semantics as :meth:`run_command` too.
+
         Returns:
             BwrapCommandHandle with .stdout, .stderr, .wait(), .kill(),
             and .cleanup().
@@ -1458,7 +1675,10 @@ class BwrapSandbox:
         if not self._running or not self._bwrap_path:
             raise BwrapSandboxError("Sandbox not started")
 
-        bwrap_args = self._build_bwrap_args(command, env=env, cwd=cwd)
+        bwrap_args = self._build_bwrap_args(
+            command, env=env, cwd=cwd, extra_rw_binds=extra_rw_binds,
+            workspace_root=workspace_root, session_files_dir=session_files_dir,
+        )
 
         if not hasattr(self, '_streaming_handles'):
             self._streaming_handles: list[BwrapCommandHandle] = []
@@ -1648,6 +1868,9 @@ class BwrapSandbox:
         command: str,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        extra_rw_binds: list[str] | None = None,
+        workspace_root: str | None = None,
+        session_files_dir: str | None = None,
     ) -> list[str]:
         """Build the full bwrap argument list.
 
@@ -1655,6 +1878,20 @@ class BwrapSandbox:
         shell quoting needed because each argument is passed separately.
 
         On WSL, this list is directly appended after ``wsl.exe -d distro --``.
+
+        ``extra_rw_binds`` are PER-CALL host paths (issue #984) that must be
+        writable for this one command — the workspace, static extra roots and
+        the turn's authorized output dirs.  They are converted to their
+        sandbox paths and hard ``--bind``-ed after the read-only ``/mnt``
+        mount, so a missing or unmappable source fails loudly instead of
+        silently running without the granted write access.
+
+        ``workspace_root`` / ``session_files_dir`` (host paths, #1007 review)
+        feed the cross-session guard: when the workspace root is in the rw
+        set, ``<workspace>/sessions`` is re-mounted READ-ONLY after it (other
+        sessions live there) and this session's own files dir is re-opened
+        writable after THAT — see :func:`_cross_session_guard_args`.  Both
+        default to ``None``, which keeps the previous argument list exactly.
 
         The sandbox layout:
         /usr, /bin, /lib, etc — read-only bind mounts from host
@@ -1699,8 +1936,13 @@ class BwrapSandbox:
         # Windows files are accessible via /mnt/c, /mnt/d, etc. in WSL.
         # We need to bind-mount /mnt so the sandbox can access the
         # workspace files that live on the Windows filesystem.
+        # READ-ONLY since #984: the whole Windows user data area used to be
+        # writable through this one mount, so a python `open(..., "w")`
+        # bypassed the shell write guard.  Writable paths are re-opened
+        # below with an explicit hard --bind (workspace, extra roots,
+        # per-call authorized dirs).
         if self._use_wsl:
-            args.extend(["--bind-try", "/mnt", "/mnt"])
+            args.extend(["--ro-bind-try", "/mnt", "/mnt"])
 
         # ── Writable overlays ───────────────────────────────────────
         args.extend(["--tmpfs", "/tmp"])
@@ -1728,6 +1970,26 @@ class BwrapSandbox:
             args.extend(["--ro-bind", src, src])
         for src in self.extra_rw_binds:
             args.extend(["--bind", src, src])
+
+        # ── Per-call writable binds (#984) ──────────────────────────
+        # These land AFTER the read-only ``/mnt`` mount above, so a later
+        # bind re-opens exactly the authorized subtrees.  Hard ``--bind``,
+        # never ``--bind-try``: a missing/unmappable source must fail the
+        # command loudly instead of silently running without the write
+        # access the caller granted (and without falling back to the host).
+        rw_sources: list[str] = list(self.extra_rw_binds)
+        for raw in extra_rw_binds or []:
+            src = _host_path_to_sandbox(raw)
+            rw_sources.append(src)
+            args.extend(["--bind", src, src])
+
+        # ── Cross-session guard (#1007 review) ──────────────────────
+        # ``<workspace>/sessions`` was re-opened writable by the bind above;
+        # close it again (later mount wins) and keep only THIS session's own
+        # files dir writable.
+        args.extend(_cross_session_guard_args(
+            workspace_root, session_files_dir, rw_sources,
+        ))
 
         # ── Die with parent ─────────────────────────────────────────
         args.append("--die-with-parent")

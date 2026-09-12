@@ -24,18 +24,18 @@ from typing import Any
 
 from loguru import logger
 
+from miqi.execution.hook_runtime import HookPoint, HookRuntime
+from miqi.execution.permission_engine import (
+    PermissionDecision,
+    PermissionEngine,
+    PermissionVerdict,
+)
 from miqi.execution.sandbox_policy import (
+    SandboxDeniedError,
     SandboxPolicyEngine,
     SandboxSelection,
     SandboxType,
-    SandboxDeniedError,
 )
-from miqi.execution.permission_engine import (
-    PermissionEngine,
-    PermissionDecision,
-    PermissionVerdict,
-)
-from miqi.execution.hook_runtime import HookRuntime, HookPoint, HookOutcome
 from miqi.protocol.events import (
     ApprovalRequestedEvent,
     ApprovalResolvedEvent,
@@ -49,6 +49,24 @@ VALID_APPROVAL_DECISIONS = frozenset({
     "once", "session", "always", "deny", "allow", "allow_permanent",
 })
 _LEGACY_DECISION_MAP = {"allow": "once", "allow_permanent": "always"}
+
+# Tools that mutate the filesystem: always receive the sandbox selection and
+# session key so tool bodies can enforce sandboxing and asset tracking.
+_FILE_MUTATION_TOOLS = frozenset({
+    "write_file", "edit_file", "delete_file", "apply_patch",
+    "read_file", "list_dir",
+    "docx_write", "pptx_write", "xlsx_write",
+    "create_docx", "create_pptx", "create_xlsx",
+    "create_pdf", "pdf_write", "pdf_read",
+    "edit_docx", "append_xlsx",
+    "paper_download",
+    # graph_render 写 svg/html 产物 + 读源 JSON——需 _session_key
+    # 注入否则资产栏追踪永不生效（CodeRabbit #761）
+    "graph_render",
+    # #984: spawn 是子 agent 的授权根继承入口——父 turn 的 _user_roots 经此
+    # 传到 AgentControl.spawn，否则子 agent 的 exec/文件工具拿不到任何根。
+    "spawn",
+})
 
 # Phase 31.4: max lengths for sanitized approval metadata fields
 _MAX_DESCRIPTION_LENGTH = 500
@@ -163,10 +181,17 @@ def _sanitize_exc_for_ui(exc: BaseException) -> str:
     # Truncate to a reasonable length
     if len(raw) > 300:
         raw = raw[:300] + "…"
-    # Strip common sensitive patterns (absolute paths, URLs with credentials)
+    # Strip common sensitive patterns (absolute paths, URLs with credentials).
+    # URL 必须先行替换成整体（前端 sanitizeUiMessage 同序）：先跑路径正则
+    # 会把 https://user:secret@host/path 里的路径段先打码，URL 正则随后
+    # 无法整体匹配，凭据 `secret` 泄漏（#991 review）。
+    # 大小写不敏感 + 不设长度上限：HTTPS:// 大写 scheme 与超长凭据 URL 也
+    # 必须整体替换。raw 已在上方截断到 300 字符，匹配长度天然有界。
     import re as _re
-    raw = _re.sub(r'(?:/[^\s"\'<>|:]{1,200})+', '[path]', raw)
-    raw = _re.sub(r'https?://[^\s"\'<>]{1,200}', '[url]', raw)
+    raw = _re.sub(r'https?://[^\s"\'<>]+', '[url]', raw, flags=_re.IGNORECASE)
+    # 负向后顾：斜杠段前面不能紧跟单词字符，避免把 deepseek/deepseek-v4-flash
+    # 这类 provider/model id 误当 Unix 路径打码（前端 sanitizeUiMessage 同款修复）。
+    raw = _re.sub(r'(?<![A-Za-z0-9_.-])(?:/[^\s"\'<>|:]{1,200})+', '[path]', raw)
     raw = _re.sub(r'\b[A-Za-z0-9+/=]{40,}\b', '[token]', raw)
     return f"{type(exc).__name__}: {raw}" if raw else type(exc).__name__
 
@@ -398,7 +423,7 @@ class ToolOrchestrator:
         except asyncio.CancelledError:
             ctx.result = "工具执行已取消"
             ctx.status = OrchestrationResult.CANCELLED
-        except Exception as e:
+        except Exception:
             logger.exception("Tool orchestrator error for {}", ctx.tool_name)
             ctx.result = f"工具执行失败 {ctx.tool_name}：工具执行异常"
             ctx.status = OrchestrationResult.TOOL_ERROR
@@ -731,7 +756,8 @@ class ToolOrchestrator:
         # so that new sessions / restarts pick up this approval.
         try:
             from miqi.agent.command_approval import (
-                approve_permanent, _save_permanent_allowlist,
+                _save_permanent_allowlist,
+                approve_permanent,
             )
             approve_permanent(pattern)
             _save_permanent_allowlist()
@@ -876,19 +902,15 @@ class ToolOrchestrator:
         # the policy engine never returns NONE for them, so this is
         # normally RESTRICTED.  Injecting even NONE is future-proofing
         # for tool-body sandbox enforcement and auditing.
-        _FILE_MUTATION_TOOLS = frozenset({
-            "write_file", "edit_file", "delete_file", "apply_patch",
-            "read_file", "list_dir",
-            "docx_write", "pptx_write", "xlsx_write",
-            "create_docx", "create_pptx", "create_xlsx",
-            "create_pdf", "pdf_write", "pdf_read",
-            "edit_docx", "append_xlsx",
-            "paper_download",
-            # graph_render 写 svg/html 产物 + 读源 JSON——需 _session_key
-            # 注入否则资产栏追踪永不生效（CodeRabbit #761）
-            "graph_render",
-        })
         kwargs = {**ctx.arguments}
+        # #984 (R2): ``_user_roots`` is a harness-owned channel — it appears in
+        # no tool schema, and object validation only walks declared keys
+        # (base.py:112-114), so a model-supplied value would ride through
+        # ``ctx.arguments`` and re-open the write boundary this turn's sensed
+        # roots are meant to gate.  Drop it first, then inject the harness
+        # value below — empty list included, so "no roots this turn" is an
+        # explicit harness answer instead of a fall-through to the model's list.
+        kwargs.pop("_user_roots", None)
         if ctx.tool_name == "exec" or ctx.tool_name in _FILE_MUTATION_TOOLS:
             kwargs["_sandbox"] = sandbox
             # _session_key already includes client_id prefix (e.g. "miqi-desktop:desktop:xxx")
@@ -896,8 +918,13 @@ class ToolOrchestrator:
             # #821: auto-sensed user-mentioned output dirs — mirrors the KUN
             # tool host injection so file tools accept the user's explicitly
             # requested output location (e.g. Desktop/test_result).
-            if ctx.user_mentioned_roots:
-                kwargs["_user_roots"] = list(ctx.user_mentioned_roots)
+            kwargs["_user_roots"] = list(ctx.user_mentioned_roots or [])
+        elif ctx.tool_name.startswith("mcp_"):
+            # MCP 工具（issue #927）：注入会话上下文供 slurm 计费握手使用
+            #（MCPToolWrapper 会 pop 掉，不传给 MCP 服务端）。
+            kwargs["_session_key"] = ctx.session_id
+            kwargs["_turn_id"] = ctx.turn_id
+            kwargs["_tool_call_id"] = ctx.tool_call_id
         elif sandbox.sandbox_type != SandboxType.NONE:
             kwargs["_sandbox"] = sandbox
 
@@ -946,7 +973,7 @@ class ToolOrchestrator:
             ))
             result = f"工具执行失败 {ctx.tool_name}：{safe_msg}"
             if ctx.turn_id:
-                result += f"\n[Hint: Use 'exec' to inspect the environment or try a different approach.]"
+                result += "\n[Hint: Use 'exec' to inspect the environment or try a different approach.]"
             ctx.status = OrchestrationResult.TOOL_ERROR
         else:
             dt_ms = int((time.monotonic() - t0) * 1000)

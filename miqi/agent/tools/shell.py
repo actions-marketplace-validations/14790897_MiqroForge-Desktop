@@ -254,9 +254,53 @@ _SYSTEM_INSTALL_VERBS: dict[str, tuple[str, ...]] = {
 _SYSTEM_INSTALL_NOT_ENABLED_MSG = (
     "Error: 系统包安装命令被拦截——沙箱内无 root 权限且系统目录只读，"
     "apt-get 无法在沙箱内安装。\n"
-    "请让用户在配置中开启 tools.sandbox.allow_system_installs 后重试："
-    "开启后 sudo apt-get install ... 会自动以 root 在 WSL 发行版中执行，"
-    "安装一次跨会话持久，装完即可在沙箱内使用。"
+    "请在 设置 > 沙箱隔离 中开启「允许系统包安装」后重试，或在授权确认卡中选择"
+    "「允许本次安装」：开启后 sudo apt-get install ... 会自动以 root 在 WSL "
+    "发行版中执行，安装一次跨会话持久，装完即可在沙箱内使用。"
+)
+
+#: 系统安装授权卡的应用级串行锁（CodeRabbit #875 09-01 review）：跨
+#: ExecTool 实例（不同会话/registry）的弹卡必须全局串行——per-instance 锁
+#: 只挡同一实例，不同会话并发安装时非可见会话的卡会静默超时而非排队。
+#: asyncio.Lock 绑定事件循环，这里按运行中 loop 惰性创建（生产 = bridge
+#: 单 loop → 全局一把锁；测试 = per-test loop → 各自新锁）。
+_system_install_approval_lock: asyncio.Lock | None = None
+_system_install_approval_lock_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_system_install_approval_lock() -> asyncio.Lock:
+    """Return the application-wide serialization lock for approval cards.
+
+    The lock is bound to the CURRENT event loop: asyncio.Lock is loop
+    bound, so a lock created on another loop cannot be awaited here.  A
+    new lock is created when the loop changes.
+
+    ARCHITECTURE ASSUMPTION (#875 review): this is a true application
+    global ONLY because the production runtime guarantees a single
+    persistent event loop (BridgeRuntimeLoop owns every runtime/registry
+    on one loop).  If a future multi-loop runtime (threads, process
+    pools) is introduced, this degrades to per-loop serialization and
+    two approval cards could reach the foreground concurrently — revisit
+    this (e.g. a cross-loop lock) before enabling such a runtime.
+    """
+    global _system_install_approval_lock, _system_install_approval_lock_loop
+    loop = asyncio.get_running_loop()
+    if (
+        _system_install_approval_lock is None
+        or _system_install_approval_lock_loop is not loop
+    ):
+        _system_install_approval_lock = asyncio.Lock()
+        _system_install_approval_lock_loop = loop
+    return _system_install_approval_lock
+
+#: Interception message when the approval card WAS shown and the user
+#: declined or the card timed out — the NOT_ENABLED message suggests using
+#: the card, which the user just rejected, so it must not be reused here
+#: (#875 review P3-2).
+_SYSTEM_INSTALL_DENIED_MSG = (
+    "Error: 系统包安装授权未通过（拒绝或超时），本次安装未执行。\n"
+    "如需继续，请重新发起命令后在授权确认卡中选择「允许本次安装」，"
+    "或在 设置 > 沙箱隔离 中开启「允许系统包安装」。"
 )
 
 #: Interception message when system installs are enabled but the sandbox
@@ -332,6 +376,11 @@ class ExecTool(Tool):
         env_passthrough: list[str] | None = None,
         approval_callback=None,
         sandbox_manager=None,
+        system_install_approver=None,
+        shared_roots: list[Any] | None = None,
+        allow_user_dirs: bool = True,
+        workspace_root: str | None = None,
+        session_files_dir: str | None = None,
     ):
         self.timeout = timeout
         self.max_timeout = max_timeout
@@ -370,6 +419,28 @@ class ExecTool(Tool):
         self.restrict_to_workspace = restrict_to_workspace
         self.approval_callback = approval_callback
         self._sandbox_manager = sandbox_manager
+        # #854: 系统包安装授权通道——关闭状态下拦截点弹确认卡而非直接拒绝。
+        # 签名: async (command: str) -> "once" | "always" | "deny" |
+        # "deny_no_channel"。fail-closed: 无通道/异常/超时一律 deny（外部
+        # 审阅 #854；#875 review F3 增加 deny_no_channel 区分"卡从未出现"）。
+        self.system_install_approver = system_install_approver
+        # #984: host roots this tool may re-open writable inside the bwrap
+        # sandbox (workspace root + tools.extra_roots + memory/skills dirs,
+        # resolved once by tool_registry_factory).  ``allow_user_dirs``
+        # mirrors tools.auto_user_dirs and gates the per-call ``_user_roots``
+        # component — same switch the file tools honour (issue #821).
+        self._shared_roots: list[Any] = list(shared_roots or [])
+        self._allow_user_dirs = allow_user_dirs
+        # #1007 review: the workspace root is in the rw bind set (it is part
+        # of ``shared_roots``), and ``<workspace>/sessions/**`` lives under
+        # it — so every exec call re-opened OTHER sessions' files writable.
+        # These two host paths let the sandbox re-protect that subtree while
+        # keeping THIS session's own files dir writable (see
+        # ``bwrap._cross_session_guard_args``).  Both are fixed at
+        # construction, like every other bind source here; ``None`` (unknown
+        # workspace / no per-session layout) keeps the previous args exactly.
+        self._workspace_root = workspace_root
+        self._session_files_dir = session_files_dir
 
     @property
     def name(self) -> str:
@@ -434,6 +505,120 @@ class ExecTool(Tool):
             )
         return requested * 1000, None
 
+    # ── #984: per-call writable binds for the bwrap sandbox ─────────────
+
+    def _exec_rw_binds(self, user_roots: Any) -> list[str]:
+        """Host paths to re-open writable for ONE exec call (#984).
+
+        Set (plan v5 §2): workspace root ∪ static ``shared_roots`` ∪
+        per-call user-mentioned roots when ``tools.auto_user_dirs`` is on.
+        The #864 approval-card grants are deliberately NOT part of the exec
+        set — they live on the file-tool instances (``self._granted``) and
+        ExecTool holds no reference to them; exec still reaches user-mentioned
+        dirs through ``_user_roots`` (see the PR body for the residual gap).
+
+        Missing STATIC roots are skipped with a debug log: they come from
+        config, and before #984 they were never bound, so a stale entry must
+        not start failing every command.  Per-call user roots are kept
+        unconditionally — silently dropping one would revoke a grant the user
+        just made; a missing source is reported with guidance instead (see
+        :meth:`_missing_bind_sources`).
+
+        CONTRACT — every bind SOURCE here is fixed at CONSTRUCTION time.
+        Apart from ``user_roots`` (harness-injected; see
+        ``ToolOrchestrator._execute_in_sandbox``), the sources are instance
+        attributes set when the tool was built: ``self.working_dir`` and
+        ``self._shared_roots``.  The per-call ``working_dir`` argument of
+        :meth:`execute` selects the process cwd and the workspace-diff root
+        ONLY; it MUST NOT be folded into this set.  Were it honoured here, a
+        model-authored ``working_dir`` would re-open an arbitrary host
+        directory writable inside the sandbox with no grant at all, bypassing
+        the per-call ``_user_roots`` channel this issue exists to gate.
+        Locked by
+        ``tests/execution/test_exec_write_boundary_984.py::TestWorkingDirNotABindSource``.
+
+        Because the workspace root is in this set, ``<ws>/sessions/**`` —
+        every OTHER session's files — is re-opened writable by that same
+        bind.  :meth:`_execute_in_sandbox` therefore also hands the sandbox
+        ``self._workspace_root`` / ``self._session_files_dir``, and bwrap
+        re-mounts ``<ws>/sessions`` READ-ONLY after the bind with only this
+        session's own files dir re-opened after that (#1007 review).
+        """
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def _add(raw: Any, *, strict: bool) -> None:
+            try:
+                raw_str = os.fspath(raw)
+            except TypeError:
+                return
+            if not isinstance(raw_str, str) or not raw_str:
+                return
+            # #984 review: a UNC / WSL-share source (``\\wsl$\…``) has no
+            # sandbox mapping — ``_host_path_to_sandbox`` raises on it, so a
+            # hard ``--bind`` would fail EVERY command with a generic sandbox
+            # error.  It is not a bind source at all (same rule as
+            # ``filesystem.bootstrap_sandbox_roots``); the root extractors
+            # cannot produce one.
+            if raw_str.replace("\\", "/").startswith("//"):
+                logger.debug(
+                    "exec: skipping UNC rw bind (no sandbox mapping) {}", raw_str,
+                )
+                return
+            key = os.path.normcase(os.path.abspath(raw_str))
+            if key in seen:
+                return
+            if not strict:
+                try:
+                    if not os.path.exists(raw_str):
+                        logger.debug(
+                            "exec: skipping missing static rw bind {}", raw_str,
+                        )
+                        return
+                except OSError:
+                    return
+            seen.add(key)
+            out.append(raw_str)
+
+        if self.working_dir:
+            _add(self.working_dir, strict=False)
+        for root in self._shared_roots:
+            _add(root, strict=False)
+        if self._allow_user_dirs:
+            for root in user_roots or []:
+                _add(root, strict=True)
+        return out
+
+    @staticmethod
+    def _missing_bind_sources(binds: list[str] | None) -> list[str]:
+        """Bind sources that do not exist on the host, for a pre-flight error.
+
+        The per-call binds use a hard ``--bind``, so a missing source makes
+        bwrap fail the whole command.  Check the sources this process can
+        actually see (Windows drive paths on Windows, POSIX paths elsewhere)
+        and report them with guidance instead of surfacing a raw bwrap error.
+
+        UNC / WSL-share paths are not tested here: they are not bind sources
+        at all.  ``_host_path_to_sandbox`` cannot map them and raises, which
+        the sandbox path would surface as a generic 「沙箱执行失败」, so
+        :meth:`_exec_rw_binds` drops them before they reach this check — and
+        the root extractors never produce one.  WSL-native POSIX paths are
+        invisible from the Windows host and ARE left to bwrap: they bind
+        unchanged, and one that is genuinely missing fails loudly there.
+        """
+        missing: list[str] = []
+        for raw in binds or []:
+            s = str(raw).replace("\\", "/")
+            if s.startswith("//"):
+                continue  # not a bind source — see above
+            if len(s) >= 2 and s[1] == ":":
+                if os.name == "nt" and not os.path.exists(str(raw)):
+                    missing.append(str(raw))
+            elif s.startswith("/") and os.name != "nt":
+                if not os.path.exists(str(raw)):
+                    missing.append(str(raw))
+        return missing
+
     @property
     def description(self) -> str:
         from miqi.sandbox.manager import describe_exec_environment
@@ -494,6 +679,13 @@ class ExecTool(Tool):
         # Phase 31: consume SandboxSelection injected by ToolOrchestrator.
         _sandbox = kwargs.pop("_sandbox", None)
         _session_key = kwargs.pop("_session_key", None)
+
+        # #984: per-call user-mentioned output dirs — the same channel the
+        # file tools consume.  They are re-opened writable in the bwrap
+        # sandbox for THIS command only, so a runtime write (`open(...)`,
+        # `write_text`, any spelling) succeeds where the user asked without
+        # making the whole of /mnt writable again.
+        _user_roots = kwargs.pop("_user_roots", None)
 
         # Resolve sandbox_type for the begin event from the actual selection
         if _sandbox is not None:
@@ -603,6 +795,9 @@ class ExecTool(Tool):
                             ) is not None
                         )
                     ),
+                    # #984 layer 3: the same per-call grant layer 1 binds
+                    # rw — the guard must not refuse it.
+                    user_roots=_user_roots,
                 )
                 if guard_error:
                     return _ExecResult(output=guard_error, exit_code=1)
@@ -641,6 +836,9 @@ class ExecTool(Tool):
                 thread_id=thread_id,
                 # Session key for per-session sandbox isolation
                 session_key=_session_key,
+                # #984: per-call writable binds for the bwrap sandbox.
+                # Host execution paths accept and ignore them.
+                extra_rw_binds=self._exec_rw_binds(_user_roots),
             )
 
             # Phase 31: if ToolOrchestrator injected a SandboxSelection,
@@ -648,7 +846,12 @@ class ExecTool(Tool):
             # ExecTool MUST follow it — no independent sandbox decision.
             if _sandbox is not None:
                 result = await self._execute_with_sandbox_selection(
-                    _sandbox, command, cwd, **exec_kwargs,
+                    _sandbox, command, cwd,
+                    # #984 review: only the BWRAP fallback consumes it (the
+                    # other branches take no grant), so it is passed here
+                    # rather than through ``exec_kwargs``.
+                    user_roots=_user_roots,
+                    **exec_kwargs,
                 )
             # Legacy path (no orchestrator): session_key preferred, fall back to active sandbox
             elif self._sandbox_manager is not None:
@@ -665,7 +868,9 @@ class ExecTool(Tool):
                 else:
                     # Legacy fallback (no sandbox): same host-semantics
                     # re-check as the BWRAP fallback (issue #811 review).
-                    fallback_guard = self._guard_host_fallback(command, cwd)
+                    fallback_guard = self._guard_host_fallback(
+                        command, cwd, user_roots=_user_roots,
+                    )
                     if fallback_guard is not None:
                         return fallback_guard
                     # Fall back to direct execution (no sandbox)
@@ -737,6 +942,8 @@ class ExecTool(Tool):
         ledger_runtime=None,
         thread_id: str = "",
         session_key: str | None = None,
+        # #984: per-call writable host paths (workspace + authorized dirs)
+        extra_rw_binds: list[str] | None = None,
     ) -> _ExecResult:
         """Execute a command inside the bwrap sandbox with streaming I/O.
 
@@ -762,6 +969,23 @@ class ExecTool(Tool):
                 exit_code=-1, cancelled=True,
             )
 
+        # #984: the per-call rw binds use a hard --bind, so a missing source
+        # fails the command.  Report it with guidance instead of a raw bwrap
+        # error, and NEVER fall back to host execution — the command was
+        # authorized for a sandboxed write it cannot get.
+        _missing_binds = self._missing_bind_sources(extra_rw_binds)
+        if _missing_binds:
+            return _ExecResult(
+                output=(
+                    "Error: 授权写入目录不存在，命令未执行："
+                    + "、".join(_missing_binds)
+                    + "\nHint: 请先在 Windows 侧创建该目录，"
+                    "或先用文件工具写入一次（文件工具会自动创建授权目录），"
+                    "再重试本条命令。"
+                ),
+                exit_code=1,
+            )
+
         start = time.monotonic()
 
         # Build sandbox env and cwd
@@ -777,6 +1001,13 @@ class ExecTool(Tool):
         try:
             handle = await sandbox.run_command_streaming(
                 command, env=sandbox_env, cwd=sandbox_cwd,
+                extra_rw_binds=extra_rw_binds,
+                # #1007 review: the workspace root above is re-opened
+                # writable, so <workspace>/sessions must be re-protected —
+                # read-only, with this session's own files dir re-opened
+                # after it.  Both are construction-time instance attributes.
+                workspace_root=self._workspace_root,
+                session_files_dir=self._session_files_dir,
             )
         except Exception as e:
             duration_ms = int((time.monotonic() - start) * 1000)
@@ -1089,6 +1320,15 @@ class ExecTool(Tool):
         ledger_runtime=None,
         thread_id: str = "",
         session_key: str | None = None,
+        # #984: per-call writable host paths (bwrap paths only; ignored by
+        # the host-execution branches, which cannot mount anything).
+        extra_rw_binds: list[str] | None = None,
+        # #984 review: the per-call ``_user_roots`` grant itself, needed by
+        # the BWRAP→host fallback below so its guard re-check sees the same
+        # authorization the pre-flight guard did.  It is NOT splatted into
+        # ``exec_kwargs``: the host executors take no grant of their own and
+        # would reject the keyword.
+        user_roots: Any = None,
     ) -> _ExecResult:
         """Execute a command according to the ToolOrchestrator's SandboxSelection.
 
@@ -1119,6 +1359,9 @@ class ExecTool(Tool):
             # Phase 31.8: pass ledger runtime and thread_id to sub-executors
             ledger_runtime=ledger_runtime,
             thread_id=thread_id,
+            # #984: per-call rw binds — consumed by _execute_in_sandbox,
+            # accepted-and-ignored by the host paths.
+            extra_rw_binds=extra_rw_binds,
         )
 
         # ── NONE: orchestrator explicitly allowed direct execution ──────
@@ -1143,7 +1386,14 @@ class ExecTool(Tool):
             # allowed sandbox-internal paths (/home/miqi/**, /tmp) that
             # mean something else on the host.  Re-check with HOST
             # semantics before falling back (issue #811 review).
-            fallback_guard = self._guard_host_fallback(command, cwd)
+            # #984 review: the per-call grant travels with it — without it
+            # ``_guard_write_roots`` sees None and refuses the very write the
+            # user just authorized (the legacy fallback below already passed
+            # them).  ``extra_rw_binds`` is NOT the right argument here: the
+            # guard contract only ever widens for the per-call roots.
+            fallback_guard = self._guard_host_fallback(
+                command, cwd, user_roots=user_roots,
+            )
             if fallback_guard is not None:
                 return fallback_guard
             # Fall back to direct execution (e.g. during first-time
@@ -1164,7 +1414,7 @@ class ExecTool(Tool):
         if st == SandboxType.LANDLOCK:
             return _ExecResult(
                 output=(
-                    "Error: MiqroForge 尚未实现 LANDLOCK 沙箱。 "
+                    "Error: MiQroForge 尚未实现 LANDLOCK 沙箱。 "
                     "命令未执行。"
                 ),
                 exit_code=1,
@@ -1193,6 +1443,11 @@ class ExecTool(Tool):
         # Phase 31.8: ledger runtime for replay-persistent event recording
         ledger_runtime=None,
         thread_id: str = "",
+        # #984: accepted for call-site uniformity (``**common`` splat) and
+        # deliberately ignored — RESTRICTED executes on the host, where no
+        # bind exists to apply.  Its explicit _execute_direct call below
+        # must keep working without passing it (plan v6 §3).
+        extra_rw_binds: list[str] | None = None,
     ) -> _ExecResult:
         """Execute with RESTRICTED sandbox policy enforcement.
 
@@ -1595,6 +1850,11 @@ class ExecTool(Tool):
         ledger_runtime=None,
         thread_id: str = "",
         session_key: str | None = None,
+        # #984: accepted for call-site uniformity (``**exec_kwargs`` /
+        # ``**common`` splats) and deliberately ignored — host execution has
+        # no mount namespace to bind into.  Ignoring is NOT a silent
+        # downgrade: the bind only ever widened sandbox writes.
+        extra_rw_binds: list[str] | None = None,
     ) -> _ExecResult:
         """Execute a command directly on the host (no sandbox).
 
@@ -2155,6 +2415,67 @@ class ExecTool(Tool):
             return await self._sandbox_manager.get_or_create(session_key)
         return self._sandbox_manager.active_sandbox
 
+    async def _request_system_install_approval(self, command: str) -> tuple[str, bool, bool]:
+        """#854: 系统包安装授权确认卡 → (decision, persist_failed, runtime_failed)。
+
+        decision ∈ {"once", "always", "deny", "deny_no_channel"}；
+        persist_failed 仅在 decision=="always" 且 config 持久化失败时为
+        True（外部审阅 #854："允许并记住"保存失败必须对用户可见）；
+        runtime_failed 仅在 decision=="always" 且 config 已持久化但
+        runtime 切换失败时为 True（#875 review P4：重启后生效）。
+
+        - fail-closed：无 approver 通道 / 异常 / 超时一律 deny（或
+          deny_no_channel），绝不放行
+        - 并发串行：同一时刻只有一张系统安装授权卡进入前台（外部审阅 #854）
+        - "允许本次"（once）是调用级授权——不修改任何全局状态
+        """
+        if self.system_install_approver is None:
+            return ("deny_no_channel", False, False)
+        # 统一 120s 墙钟上限（CodeRabbit #875 09-01 Minor）：从调用开始计时，
+        # 覆盖应用级锁等待 + approver（含 gate 排队）全程——排队的请求不会
+        # 先无界等锁、锁到手后再拿第二个独立 120s（最坏 240s）。
+        # 锁释放由 async with 保证（取消也释放）；approver 内部的独立超时
+        # 已移除，单一 deadline 在 shell 层。
+        async def _approve_under_lock() -> tuple[str, bool, bool]:
+            async with _get_system_install_approval_lock():
+                return await self.system_install_approver(command)
+
+        try:
+            decision = await asyncio.wait_for(_approve_under_lock(), timeout=120)
+        except TimeoutError:
+            logger.warning(
+                "system install approval timed out (120s incl. lock wait) — deny"
+            )
+            return ("deny", False, False)
+        except Exception as exc:  # noqa: BLE001 - fail-closed on any error
+            # loguru: {} interpolation, NOT logging-style %s (#875 review)
+            logger.warning("system install approval failed ({}) — deny", exc)
+            return ("deny", False, False)
+        # 畸形元组（错误长度）也必须 fail-closed 而非抛穿（#875 review F8）
+        persist_failed = False
+        runtime_failed = False
+        if isinstance(decision, tuple):
+            if len(decision) not in (2, 3):
+                logger.warning(
+                    "system install approval returned malformed tuple {!r} — deny",
+                    decision,
+                )
+                return ("deny", False, False)
+            # #875 review (5th): unpack BEFORE overwriting `decision` —
+            # the previous code re-bound decision to the string first, so
+            # `len(decision) == 3` compared the string length and the
+            # runtime_failed flag was never read.
+            if len(decision) == 2:
+                decision, persist_failed = decision
+            else:
+                decision, persist_failed, runtime_failed = decision
+            persist_failed = bool(persist_failed)
+            runtime_failed = bool(runtime_failed)
+        if decision not in ("once", "always", "deny", "deny_no_channel"):
+            logger.warning("system install approval returned unknown decision {!r} — deny", decision)
+            return ("deny", False, False)
+        return (decision, persist_failed, runtime_failed)
+
     async def _maybe_route_system_install(
         self,
         command: str,
@@ -2190,24 +2511,26 @@ class ExecTool(Tool):
         4. A disabled sandbox manager (user chose direct host exec) → the
            routing never participates, not even to intercept (review #759
            O2).
-        5. ``allow_system_installs`` off → intercept with an actionable
-           message, BEFORE any sandbox resolution or approval: the command
-           is dead on arrival, no sandbox should be created for it, and the
-           message must point at the real fix (enable the option), not at
-           the sandbox (review #759 O1).
-        6. Desktop approval (when ``approval_callback`` is wired) runs here
+        5. Guard + normalize run BEFORE any card or approval — a command
+           that fails the deny-pattern re-check or single-command
+           normalization is refused outright; only commands that will
+           actually execute reach the approval card, and the card shows the
+           NORMALIZED command, i.e. exactly what runs as root (#875 review
+           P3-1/P3-3).
+        6. ``allow_system_installs`` off → the approval card (once/always/
+           deny) intercepts BEFORE any sandbox resolution: no sandbox is
+           created for it.  The deny branch either points at the settings
+           page (card never shown — CLI/no desktop channel) or states the
+           refusal plainly (card denied or timed out, #875 review P3-2).
+        7. Desktop approval (when ``approval_callback`` is wired) runs here
            too — routed commands do NOT bypass the approval system; the
            user can decline, which intercepts before any sandbox is
            resolved or any root command is spawned.
-        7. A live bwrap sandbox must resolve — when none is available the
+        8. A live bwrap sandbox must resolve — when none is available the
            command is intercepted with a clear message instead of falling
            through to the normal path's Windows-cmd degradation (review
            #759 N2).
-        8. WSL-only — native Linux sandboxes get a WSL-only message.
-        9. Deny-pattern re-check (minus sudo), allow_patterns, dist-upgrade
-           refusal, and single-command normalization (see
-           :meth:`_guard_system_install_command`) — dangerous, option-
-           carrying or system-rewriting commands are refused.
+        9. WSL-only — native Linux sandboxes get a WSL-only message.
         10. Cancel check, then the normalized command is executed as root in
             the WSL distro.
         """
@@ -2236,12 +2559,51 @@ class ExecTool(Tool):
         if not getattr(self._sandbox_manager, "enabled", False):
             return None
 
+        # Guard + normalize BEFORE any card or approval (#875 review P3-1):
+        # a command that the guard would refuse (un-allowlisted flags, deny
+        # patterns, dist-upgrade, shell compounds) or that cannot be
+        # normalized must never reach the user's approval card — the user
+        # would approve something that then gets refused anyway.  The card
+        # therefore shows the NORMALIZED command, i.e. exactly what will
+        # execute (display == execution, #875 review P3-3).
+        guard_error = self._guard_system_install_command(command)
+        if guard_error:
+            return _ExecResult(output=guard_error, exit_code=1)
+
+        normalized = self._normalize_system_install(command)
+        if normalized is None:
+            return _ExecResult(output=_SYSTEM_INSTALL_SINGLE_MSG, exit_code=1)
+
+        # 显示=执行（#875 review F6）：把非交互 flag（-y/--non-interactive/
+        # --noconfirm）注入归一化命令——卡片显示的就是最终以 root 执行的
+        # 命令（_inject_noninteractive_flags 幂等，执行时再次调用无副作用）。
+        normalized = self._inject_noninteractive_flags(normalized)
+
+        persist_failed = False
+        runtime_failed = False  # #875 review P4: 弹卡分支可能置位
+
         # O1: check the allow toggle before touching the sandbox.  When it
-        # is off the command is dead on arrival — no sandbox is created for
-        # it, no approval is prompted, and the user is pointed at the real
-        # fix (enable allow_system_installs) rather than at the sandbox.
+        # is off the command is not dead on arrival — an approval card is
+        # shown instead of hard-rejecting, so a non-developer user can
+        # grant the install without editing config.json (#854).
         if not getattr(self._sandbox_manager, "allow_system_installs", False):
-            return _ExecResult(output=_SYSTEM_INSTALL_NOT_ENABLED_MSG, exit_code=1)
+            # 弹系统安装授权卡（once/always/deny），替代直接拒绝：
+            # "允许本次"是调用级授权，不修改全局开关（外部审阅 #854）；
+            # "允许并记住"由 approver 内部走统一入口持久化后放行。
+            # 无桌面通道（deny_no_channel）时指向设置页（#875 review F3）。
+            decision, persist_failed, runtime_failed = (
+                await self._request_system_install_approval(normalized)
+            )
+            if decision not in ("once", "always"):
+                # 卡已弹但用户拒绝/超时 → 明确告知；无桌面通道（卡从未出现）
+                # → 指向设置页（#875 review P3-2/F3——approver 恒非 None，
+                # 以 deny_no_channel 决策区分，而非 approver 是否为 None）。
+                if decision == "deny_no_channel":
+                    return _ExecResult(output=_SYSTEM_INSTALL_NOT_ENABLED_MSG, exit_code=1)
+                return _ExecResult(output=_SYSTEM_INSTALL_DENIED_MSG, exit_code=1)
+            # runtime_failed (#875 review)：config 已保存但 runtime 未生效——
+            # 提示交给 _execute_system_install 输出（与 persist_failed 同路径），
+            # 不在此处中断执行流程。
 
         # Phase 77 (#759) + review F2: routed commands must not bypass the
         # approval system.  Same call the normal path uses; commands that
@@ -2277,14 +2639,6 @@ class ExecTool(Tool):
         if not getattr(sandbox, "supports_system_installs", False):
             return _ExecResult(output=_SYSTEM_INSTALL_WSL_ONLY_MSG, exit_code=1)
 
-        guard_error = self._guard_system_install_command(command)
-        if guard_error:
-            return _ExecResult(output=guard_error, exit_code=1)
-
-        normalized = self._normalize_system_install(command)
-        if normalized is None:  # defensive — the guard already refuses these
-            return _ExecResult(output=_SYSTEM_INSTALL_SINGLE_MSG, exit_code=1)
-
         if cancel_event is not None and cancel_event.is_set():
             return _ExecResult(
                 output="Error: 命令在启动前被取消。",
@@ -2296,6 +2650,11 @@ class ExecTool(Tool):
             event_emitter=event_emitter, turn_id=turn_id,
             tool_call_id=tool_call_id,
             requested_timeout_ms=requested_timeout_ms,
+            # #875 review F4/P4：persist_failed / runtime_failed 显式传递
+            # （提示只属于本次安装），不再用实例标志——实例标志在早期返回路径
+            # （拒绝/无沙箱/WSL-only）会残留，导致后续安装误报。
+            persist_failed=persist_failed,
+            runtime_failed=runtime_failed,
         )
 
     async def _execute_system_install(
@@ -2308,6 +2667,10 @@ class ExecTool(Tool):
         # min(requested, _SYSTEM_INSTALL_TIMEOUT) instead of the fixed
         # 1200 s budget alone.
         requested_timeout_ms: int | None = None,
+        # #875 review F4: "允许并记住"持久化失败提示（显式传递，不用实例标志）
+        persist_failed: bool = False,
+        # #875 review P4: config 已保存但 runtime 未立即生效（重启后生效）
+        runtime_failed: bool = False,
     ) -> _ExecResult:
         """Run a normalized install command as root in the WSL distro (#759).
 
@@ -2315,8 +2678,9 @@ class ExecTool(Tool):
         :meth:`_normalize_system_install` (already prefix-stripped, only
         allowlisted flags and package tokens) — it is safe to embed in
         ``bash -c``.  The non-interactive flag (-y / --non-interactive /
-        --noconfirm) is injected so the root run never hangs on a TTY
-        prompt.
+        --noconfirm) is injected (idempotently — the routing already
+        injected it so the card displays the final executed command, #875
+        review F6) so the root run never hangs on a TTY prompt.
 
         The result is buffered (no streaming) with a dedicated long
         timeout; texlive-scale installs can emit tens of MB of progress
@@ -2424,6 +2788,21 @@ class ExecTool(Tool):
             output_parts.append(f"STDERR:\n{err.rstrip()}")
         if rc != 0:
             output_parts.append(f"\nExit code: {rc}")
+        # 外部审阅 #854 疑点 1 → B + #875 review P2/F4：持久化失败必须可见，
+        # 且与安装命令成败无关（rc==0 才提示会漏掉安装失败的情况）——用户
+        # 点了「允许并记住」，却可能在重启后丢失授权，必须无条件告知。
+        if persist_failed:
+            output_parts.append(
+                "\n[提示] 本次安装已放行，但授权保存失败，「允许系统包安装」"
+                "未开启，重启后需要重新授权。"
+            )
+        if runtime_failed:
+            # #875 review P4: config 持久化成功但 runtime 未生效——用户点了
+            # 「允许并记住」却看到当前会话仍未开启，必须无条件告知。
+            output_parts.append(
+                "\n[提示] 「允许并记住」已保存到配置，但当前运行时未能立即生效——"
+                "本次安装已放行，重启后系统包安装将自动以 root 执行。"
+            )
 
         return _ExecResult(
             output="\n".join(output_parts),
@@ -2436,6 +2815,7 @@ class ExecTool(Tool):
 
     def _guard_command(
         self, command: str, cwd: str, *, sandbox_active: bool = False,
+        user_roots: Any = None,
     ) -> str | None:
         """Path-aware capability guard for exec commands (issue #811).
 
@@ -2454,15 +2834,20 @@ class ExecTool(Tool):
         ``restrict_to_workspace`` string checks still apply to them.
         ``allow_patterns`` (when configured) still applies to the whole
         command.
+
+        ``user_roots`` is the per-call #821 grant (the output dirs the
+        user named).  It widens the engine's mutation scope exactly when
+        layer 1 binds them rw, so the guard never refuses a write the
+        kernel just granted (#984 layer 3).
         """
         from miqi.agent.command_guard import (
             FILE_OP_PATTERN_EXCLUSIONS,
-            RuntimePaths,
             evaluate_command,
         )
 
         verdict = evaluate_command(
-            command, self._guard_runtime_paths(cwd, sandbox_active),
+            command,
+            self._guard_runtime_paths(cwd, sandbox_active, user_roots),
         )
         if not verdict.allowed:
             return verdict.message
@@ -2501,7 +2886,7 @@ class ExecTool(Tool):
         return None
 
     def _guard_host_fallback(
-        self, command: str, cwd: str,
+        self, command: str, cwd: str, user_roots: Any = None,
     ) -> _ExecResult | None:
         """Re-check the guard with HOST path semantics before a
         host-fallback execution (issue #811 review).
@@ -2516,7 +2901,9 @@ class ExecTool(Tool):
         """
         if self.approval_callback is not None:
             return None
-        guard_error = self._guard_command(command, cwd, sandbox_active=False)
+        guard_error = self._guard_command(
+            command, cwd, sandbox_active=False, user_roots=user_roots,
+        )
         if guard_error:
             return _ExecResult(output=guard_error, exit_code=1)
         return None
@@ -2544,12 +2931,51 @@ class ExecTool(Tool):
 
         return None
 
-    def _guard_runtime_paths(self, cwd: str, sandbox_active: bool):
+    def _guard_write_roots(self, user_roots: Any) -> tuple[str, ...]:
+        """Per-call authorized roots the static guard may treat as writable.
+
+        Only the ``_user_roots`` grant (#821) qualifies, and only when
+        ``allow_user_dirs`` (``tools.auto_user_dirs``) is on — i.e. exactly
+        when :meth:`_exec_rw_binds` re-opens them inside the sandbox.
+        Without this the guard would refuse the very writes layer 1 just
+        granted (#984 layer 3: the tightening ships WITH the authorization
+        channel, never before it).
+
+        The static ``shared_roots`` and the workspace root are deliberately
+        NOT included: their guard semantics (Level 1 read-only outside the
+        session tree) are unchanged — an inline write into a configured
+        ``tools.extra_roots`` dir is still refused here and the refusal
+        points at the file tool.  Non-absolute entries are dropped, and
+        each root is RESOLVED: the classifier resolves every operand, so an
+        8.3 / symlink / case-variant spelling of the root would otherwise
+        silently fail the grant.
+        """
+        if not self._allow_user_dirs:
+            return ()
+        out: list[str] = []
+        for raw in user_roots or []:
+            try:
+                s = os.fspath(raw)
+            except TypeError:
+                continue
+            if not (isinstance(s, str) and s and os.path.isabs(s)):
+                continue
+            try:
+                out.append(str(Path(s).resolve()))
+            except (OSError, ValueError):
+                continue
+        return tuple(out)
+
+    def _guard_runtime_paths(
+        self, cwd: str, sandbox_active: bool, user_roots: Any = None,
+    ):
         """Build the RuntimePaths context for the capability engine.
 
         Resolves the host workspace root and the session files dir
         (``<workspace>/sessions/<key>/files``) so the engine can apply
-        the Level 0/1/2 path hierarchy from issue #811.
+        the Level 0/1/2 path hierarchy from issue #811.  ``user_roots``
+        (per-call #821 grant) becomes ``extra_write_roots`` — the engine's
+        extra mutation scope, matching layer 1's rw binds (#984).
         """
         from miqi.agent.command_guard import RuntimePaths
 
@@ -2594,6 +3020,7 @@ class ExecTool(Tool):
             sandbox_cwd=self._resolve_sandbox_cwd(cwd) if sandbox_active else "",
             miqi_home=miqi_home,
             host_home=str(Path.home()) if hasattr(Path, "home") else None,
+            extra_write_roots=self._guard_write_roots(user_roots),
         )
 
     async def _mirror_downloaded_files(

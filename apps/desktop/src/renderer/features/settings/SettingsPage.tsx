@@ -5,6 +5,8 @@ import { Button } from '../../components/ui/Button';
 import { Input } from '../../components/ui/Input';
 import { cn } from '../../lib/utils';
 import { getCachedConfig, invalidateConfigCache } from '../../lib/configCache';
+import { sanitizeUiMessage } from '../../lib/sanitizeUiMessage';
+import { QraftLoginButton } from './components/QraftLoginCard';
 import {
   RefreshCw,
   Download,
@@ -37,11 +39,11 @@ import {
   Bot,
   Palette,
   Wrench,
-  Plug,
   Database,
   BookOpen,
   ShieldCheck,
   KeyRound,
+  LogIn,
   Puzzle,
   Globe,
   CloudCog,
@@ -49,6 +51,8 @@ import {
   ScrollText,
   FileText,
   MessageSquare,
+  Scale,
+  Package,
   type LucideIcon,
 } from 'lucide-react';
 import { useRuntime } from '../../contexts/RuntimeContext';
@@ -79,11 +83,11 @@ import {
 } from '../../lib/uiPreferences';
 import { ProvidersPage } from '../providers/ProvidersPage';
 import { ModelSelect } from '../providers/components/ModelSelect';
+import { useQraftStatus } from '../../hooks/useQraftStatus';
 import { ChannelsPage } from '../channels/ChannelsPage';
 import { ApprovalsPage } from '../approvals/ApprovalsPage';
 import { WorkspacePage } from '../workspace/WorkspacePage';
 import { CronPage } from '../cron/CronPage';
-import { MCPsPage } from '../mcps/MCPsPage';
 import { ExperiencePage } from '../experience/ExperiencePage';
 import { SkillsPage } from '../skills/SkillsPage';
 import { MemoryPage } from '../memory/MemoryPage';
@@ -93,6 +97,7 @@ import { PluginMarket } from '../plugins/PluginMarket';
 import WslStatusPage from '../wsl/WslStatusPage';
 import { FeedbackPage } from '../feedback/FeedbackPage';
 import { QraftPage } from './components/QraftPage';
+import { PrivacyPage } from './components/PrivacyPage';
 
 export type SettingsTab =
   | 'general'
@@ -104,7 +109,6 @@ export type SettingsTab =
   | 'appearance'
   | 'agents'
   | 'skills'
-  | 'mcps'
   | 'memory'
   | 'experience'
   | 'permissions'
@@ -114,6 +118,7 @@ export type SettingsTab =
   | 'wsl'
   | 'logs'
   | 'archived'
+  | 'privacy'
   | 'docs'
   | 'feedback';
 
@@ -185,13 +190,6 @@ const SETTINGS_CATEGORIES: SettingsCategory[] = [
     label: '集成',
     items: [
       {
-        value: 'mcps',
-        label: 'MCP 服务',
-        description: '外部工具协议服务',
-        keywords: ['mcp', 'tool', '协议'],
-        icon: Plug,
-      },
-      {
         value: 'plugins',
         label: '插件',
         description: '插件市场与扩展',
@@ -214,8 +212,8 @@ const SETTINGS_CATEGORIES: SettingsCategory[] = [
       },
       {
         value: 'qraft',
-        label: 'Qraft 平台',
-        description: 'Qraft 账号 OAuth2 登录',
+        label: 'MiQroForge 平台',
+        description: 'MiQroForge 账号 OAuth2 登录',
         keywords: ['qraft', 'oauth', '账号', '登录', 'miqroera'],
         icon: CloudCog,
       },
@@ -288,6 +286,13 @@ const SETTINGS_CATEGORIES: SettingsCategory[] = [
         icon: Archive,
       },
       {
+        value: 'privacy',
+        label: '隐私协议',
+        description: '隐私政策与数据使用',
+        keywords: ['privacy', '隐私', '协议', 'legal'],
+        icon: Scale,
+      },
+      {
         value: 'docs',
         label: '文档',
         description: '产品与开发文档',
@@ -331,6 +336,23 @@ function SandboxToggle() {
       pollReady
       readyLabel="已开启（推荐）"
       togglingLabel="正在安装依赖…"
+    />
+  );
+}
+
+function AllowSystemInstallsToggle() {
+  return (
+    <SettingsToggle
+      icon={Package}
+      testId="allow-system-installs-toggle"
+      label="允许系统包安装"
+      getInitial={(cfg) => cfg?.tools?.sandbox?.allowSystemInstalls ?? false}
+      onToggle={async (next) => {
+        const r: any = await window.miqi.sandbox.setAllowSystemInstalls(next);
+        if (r?.error) throw new Error(r.error);
+      }}
+      readyLabel="已开启"
+      togglingLabel="正在保存…"
     />
   );
 }
@@ -436,7 +458,13 @@ function TrustedDirectoriesSection() {
 }
 
 // ---- General Config Tab ----
-function GeneralTab({ onReopenSetup }: { onReopenSetup?: () => void }) {
+function GeneralTab({
+  onReopenSetup,
+  onGoToQraft,
+}: {
+  onReopenSetup?: () => void;
+  onGoToQraft: () => void;
+}) {
   const [agentName, setAgentName] = useState('');
   const [workspace, setWorkspace] = useState('');
   const [model, setModel] = useState('');
@@ -444,6 +472,12 @@ function GeneralTab({ onReopenSetup }: { onReopenSetup?: () => void }) {
   const [maxTokens, setMaxTokens] = useState('');
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const { loggedIn, gatewayActive, aiGatewayKnown } = useQraftStatus();
+  // #922 网关门控：未登录引导登录；登录且网关 active（或未下发）可改模型。
+  const canUseModel = loggedIn && (gatewayActive || !aiGatewayKnown);
+  const gatewayBlocked = loggedIn && aiGatewayKnown && !gatewayActive;
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     getCachedConfig()
@@ -461,20 +495,31 @@ function GeneralTab({ onReopenSetup }: { onReopenSetup?: () => void }) {
 
   const handleSave = async () => {
     setSaving(true);
+    setSaveError(null);
+    // 新一轮保存开始时清掉上一次的成功状态与定时器：失败不应残留
+    // 「已保存」，旧定时器也不应提前清掉新的成功状态（#933 review）。
+    setSaved(false);
+    if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
     try {
       const defaults: Record<string, unknown> = {
         name: agentName,
         workspace,
-        model,
         temperature: temperature === '' ? '' : parseFloat(temperature),
         maxTokens: maxTokens === '' ? '' : parseInt(maxTokens),
       };
+      // 模型下拉只允许预设选择：未选择（历史遗留模型不在可用目录中）时
+      // 不把空值存回配置 —— 后端现在会拒绝空模型（#929 收口）。
+      if (model) {
+        defaults.model = model;
+      }
       await window.miqi.config.update({ agents: { defaults } });
       invalidateConfigCache();
       setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
-    } catch {
-      /* ignore */
+      savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
+    } catch (err: unknown) {
+      // 后端收口（#929）会拒绝无法解析/无凭据的模型值 —— 不能再静默吞掉，
+      // 否则用户看到「点了保存没反应」（#929 review）。
+      setSaveError(sanitizeUiMessage(err instanceof Error ? err.message : String(err)));
     }
     setSaving(false);
   };
@@ -516,7 +561,30 @@ function GeneralTab({ onReopenSetup }: { onReopenSetup?: () => void }) {
 
       <div className="flex flex-col gap-1.5">
         <label className="text-size-sm font-medium text-[var(--text-muted)]">默认模型</label>
-        <ModelSelect value={model} onChange={setModel} />
+        {canUseModel ? (
+          <ModelSelect value={model} onChange={setModel} />
+        ) : gatewayBlocked ? (
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-muted)] px-3 py-2.5">
+            <span className="text-sm text-[var(--text-muted)]">
+              AI 网关未就绪（平台开通中或不可用），暂不可选模型
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onGoToQraft}
+              data-testid="general-go-gateway"
+            >
+              <LogIn size={14} />
+              查看平台账号
+            </Button>
+          </div>
+        ) : (
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-muted)] px-3 py-2.5">
+            <span className="text-sm text-[var(--text-muted)]">登录后使用平台内置模型</span>
+            {/* #1000 未登录拦截：一键浏览器登录（原「去登录」仅跳设置页） */}
+            <QraftLoginButton testId="general-login-btn" size="sm" busyLabel="等待授权中…" />
+          </div>
+        )}
       </div>
 
       <div className="grid grid-cols-2 gap-3">
@@ -551,6 +619,12 @@ function GeneralTab({ onReopenSetup }: { onReopenSetup?: () => void }) {
         {saved ? '已保存' : '保存'}
       </Button>
 
+      {saveError && (
+        <div className="rounded-lg px-3 py-2 bg-[var(--accent-soft)] text-xs text-[var(--danger)]">
+          {saveError}
+        </div>
+      )}
+
       {/* ---- Sandbox ---- */}
       <div className="pt-4 border-t border-[var(--border-subtle)]">
         <h3
@@ -564,6 +638,16 @@ function GeneralTab({ onReopenSetup }: { onReopenSetup?: () => void }) {
           关闭后直接操作主机文件系统（无隔离，性能更好但风险更高）。
         </p>
         <SandboxToggle />
+        <div className="mt-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--surface)] px-3 py-2.5">
+          <AllowSystemInstallsToggle />
+          <p className="text-size-xs text-[var(--text-muted)] mt-1">
+            开启后，AI 可将 apt 等系统包安装请求转交给 WSL，并以{' '}
+            <span className="text-[var(--accent)] font-medium">root 权限</span> 执行（仅 Windows +
+            WSL）。此权限会{' '}
+            <span className="text-[var(--accent)] font-medium">持续保存到后续会话</span>
+            。软件包安装脚本可能以 root 权限执行代码。仅在你信任 AI 操作时开启。
+          </p>
+        </div>
       </div>
 
       {/* ---- Inline Exec Output ---- */}
@@ -624,6 +708,8 @@ function WebToolsTab() {
   const [showKeys, setShowKeys] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     getCachedConfig()
@@ -667,6 +753,11 @@ function WebToolsTab() {
 
   const handleSave = async () => {
     setSaving(true);
+    setSaveError(null);
+    // 与 GeneralTab 一致：新一轮保存开始时清掉上一次的成功状态与定时器
+    //（#933 review）。
+    setSaved(false);
+    if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
     try {
       await window.miqi.config.update({
         tools: {
@@ -690,9 +781,10 @@ function WebToolsTab() {
       });
       invalidateConfigCache();
       setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
-    } catch {
-      /* ignore */
+      savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
+    } catch (err: unknown) {
+      // 不再静默吞掉（#929 review）：用户需要看到保存为什么失败
+      setSaveError(sanitizeUiMessage(err instanceof Error ? err.message : String(err)));
     }
     setSaving(false);
   };
@@ -988,6 +1080,12 @@ function WebToolsTab() {
         {saved ? <Check size={14} /> : <Save size={14} />}
         {saved ? '已保存' : '保存所有 Web 设置'}
       </Button>
+
+      {saveError && (
+        <div className="rounded-lg px-3 py-2 bg-[var(--accent-soft)] text-xs text-[var(--danger)]">
+          {saveError}
+        </div>
+      )}
     </div>
   );
 }
@@ -2293,7 +2391,7 @@ function DocsTab() {
     <div className="flex flex-col h-full overflow-y-auto">
       <div className="px-6 pt-5 pb-3 shrink-0">
         <div className="flex items-center justify-between">
-          <h3 className="text-subheading text-[var(--text)]">MiqroForge Desktop 文档</h3>
+          <h3 className="text-subheading text-[var(--text)]">MiQroForge Desktop 文档</h3>
           <a
             href={DOCS_BASE}
             target="_blank"
@@ -2407,12 +2505,14 @@ export function SettingsPage({
     });
   };
 
+  const goToQraft = () => setActiveTab('qraft');
+
   return (
     <div className="flex flex-col h-full min-h-0">
       <div className="px-7 py-5 border-b border-[var(--border-subtle)] flex items-center gap-4">
         <div className="min-w-0">
           <h2 className="text-xl font-semibold leading-[1.25] text-[var(--text)]">设置</h2>
-          <p className="text-sm text-[var(--text-muted)] mt-1">配置 MiqroForge 智能体和外观</p>
+          <p className="text-sm text-[var(--text-muted)] mt-1">配置 MiQroForge 智能体和外观</p>
         </div>
         <div className="relative ml-auto w-[320px] max-w-full shrink-0">
           <Search
@@ -2513,7 +2613,7 @@ export function SettingsPage({
               </div>
             )}
           >
-            <GeneralTab onReopenSetup={onReopenSetup} />
+            <GeneralTab onReopenSetup={onReopenSetup} onGoToQraft={goToQraft} />
           </ErrorBoundary>
         </Tabs.Content>
         <Tabs.Content value="providers" className="flex-1 overflow-y-auto">
@@ -2531,7 +2631,7 @@ export function SettingsPage({
               </div>
             )}
           >
-            <ProvidersPage />
+            <ProvidersPage onGoToQraft={goToQraft} />
           </ErrorBoundary>
         </Tabs.Content>
         <Tabs.Content value="channels" className="flex-1 overflow-y-auto">
@@ -2624,24 +2724,6 @@ export function SettingsPage({
             <SkillsPage />
           </ErrorBoundary>
         </Tabs.Content>
-        <Tabs.Content value="mcps" className="flex-1 overflow-y-auto">
-          <ErrorBoundary
-            fallback={(error, reset) => (
-              <div className="p-6 text-sm" style={{ color: 'var(--danger)' }}>
-                ⚠️ MCP服务设置加载失败: {error.message}
-                <button
-                  onClick={reset}
-                  className="ml-2 underline"
-                  style={{ color: 'var(--accent)' }}
-                >
-                  重试
-                </button>
-              </div>
-            )}
-          >
-            <MCPsPage />
-          </ErrorBoundary>
-        </Tabs.Content>
         <Tabs.Content value="memory" className="flex-1 overflow-y-auto">
           <ErrorBoundary
             fallback={(error, reset) => (
@@ -2718,7 +2800,7 @@ export function SettingsPage({
           <ErrorBoundary
             fallback={(error, reset) => (
               <div className="p-6 text-sm" style={{ color: 'var(--danger)' }}>
-                ⚠️ Qraft 设置加载失败: {error.message}
+                ⚠️ MiQroForge 设置加载失败: {error.message}
                 <button
                   onClick={reset}
                   className="ml-2 underline"
@@ -2824,6 +2906,24 @@ export function SettingsPage({
         </Tabs.Content>
         <Tabs.Content value="archived" className="flex-1 overflow-y-auto">
           <ArchivedTab />
+        </Tabs.Content>
+        <Tabs.Content value="privacy" className="flex-1 overflow-y-auto">
+          <ErrorBoundary
+            fallback={(error, reset) => (
+              <div className="p-6 text-sm" style={{ color: 'var(--danger)' }}>
+                ⚠️ 隐私协议加载失败: {error.message}
+                <button
+                  onClick={reset}
+                  className="ml-2 underline"
+                  style={{ color: 'var(--accent)' }}
+                >
+                  重试
+                </button>
+              </div>
+            )}
+          >
+            <PrivacyPage />
+          </ErrorBoundary>
         </Tabs.Content>
         <Tabs.Content value="docs" className="flex-1 min-h-0 flex flex-col">
           <ErrorBoundary
